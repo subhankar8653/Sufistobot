@@ -106,8 +106,8 @@ class WorkerEngine:
         async def flink_is_admin(uid: int) -> bool:
             return uid == owner_id or uid == OWNER_ID or await worker_db.admin_exist(uid)
 
-        setup_flink(app, worker_db, log_channel_id, flink_is_admin)
         setup_link_gen(app, log_channel_id, flink_is_admin)
+        setup_flink(app, worker_db, log_channel_id, flink_is_admin)
 
         # =====================================================================
         # REGISTER HANDLERS — Each handler is a closure that captures bot_doc

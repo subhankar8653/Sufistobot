@@ -73,6 +73,14 @@ def setup_link_gen(app: Client, log_channel_id: int, is_admin_func):
             _waiting[user_id].set_result(message)
             message.stop_propagation()
 
+    # Separate handler to catch /done command during custom_batch
+    @app.on_message(filters.command("done") & filters.private, group=2)
+    async def done_catcher(client: Client, message: Message):
+        user_id = message.from_user.id
+        if user_id in _waiting and not _waiting[user_id].done():
+            _waiting[user_id].set_result(message)
+            message.stop_propagation()
+
     @app.on_message(filters.command('genlink') & filters.private)
     async def handle_genlink(client: Client, message: Message):
         if not await is_admin_func(message.from_user.id):
@@ -191,7 +199,8 @@ def setup_link_gen(app: Client, log_channel_id: int, is_admin_func):
                 await message.reply("<b><i>🆑 Oᴘᴇʀᴀᴛɪᴏɴ Cᴀɴᴄᴇʟʟᴇᴅ/Tɪᴍᴇᴅ Oᴜᴛ...</i></b>")
                 break
 
-            if hasattr(rcv_msg, "text") and rcv_msg.text == "/done":
+            if (hasattr(rcv_msg, "command") and rcv_msg.command and rcv_msg.command[0] == "done") or \
+               (hasattr(rcv_msg, "text") and rcv_msg.text and rcv_msg.text.split("@")[0] == "/done"):
                 if not first_id:
                     await message.reply("<b>❌ Nᴏ ᴍᴇssᴀɢᴇs ᴡᴇʀᴇ ᴀᴅᴅᴇᴅ.</b>")
                 else:
