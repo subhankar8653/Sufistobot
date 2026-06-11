@@ -98,7 +98,6 @@ class WorkerEngine:
         app.add_handler(MessageHandler(update_activity_middleware), group=-1)
         app.add_handler(CallbackQueryHandler(update_activity_middleware), group=-1)
 
-        from worker_bot.flink_logic import setup_flink
         from worker_bot.link_gen import setup_link_gen
 
         # We need a small wrapper to pass `is_admin` to flink logic properly
@@ -107,7 +106,12 @@ class WorkerEngine:
             return uid == owner_id or uid == OWNER_ID or await worker_db.admin_exist(uid)
 
         setup_link_gen(app, log_channel_id, flink_is_admin)
-        setup_flink(app, worker_db, log_channel_id, flink_is_admin)
+
+        try:
+            from worker_bot.flink_logic import setup_flink
+            setup_flink(app, worker_db, log_channel_id, flink_is_admin)
+        except Exception as _flink_err:
+            log.warning(f"flink_logic load failed (flink disabled): {_flink_err}")
 
         # =====================================================================
         # REGISTER HANDLERS — Each handler is a closure that captures bot_doc
