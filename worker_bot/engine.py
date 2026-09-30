@@ -73,7 +73,7 @@ class WorkerEngine:
             token = decrypt_token(bot_doc["bot_token_encrypted"])
         except Exception as e:
             log.error(f"Cannot decrypt token for bot {bot_id}: {e}")
-            return
+            raise RuntimeError(f"Cannot decrypt bot token: {e}")
 
         log_channel_id = bot_doc["log_channel_id"]
         owner_id = bot_doc["owner_id"]
