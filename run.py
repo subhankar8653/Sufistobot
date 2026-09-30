@@ -16,6 +16,7 @@ if sys.stdout.encoding != 'utf-8':
         pass
 
 from pyrogram import Client
+import utils.hide_buttons  # /start menu se Updates & Developer buttons hide
 from config import API_ID, API_HASH, BOT_TOKEN, OWNER_ID, MONGO_URI, TG_BOT_WORKERS, HIBERNATION_HOURS, LOGGER
 
 log = LOGGER(__name__)
