@@ -206,9 +206,19 @@ async def toggle_bot_callback(client: Client, query: CallbackQuery):
         bot_doc = await main_db.get_bot(bot_id)
         try:
             await worker_engine.start_worker(bot_doc)
-            await main_db.set_bot_active(bot_id, True)
+            if worker_engine.get_worker(bot_id) is not None:
+                await main_db.set_bot_active(bot_id, True)
+            else:
+                raise RuntimeError("Worker did not start (check logs)")
         except Exception as e:
-            log.error(f"Failed to start bot {bot_id}: {e}")
+            log.error(f"Failed to start bot {bot_id}: {e}", exc_info=True)
+            try:
+                await client.send_message(
+                    user_id,
+                    f"<b>❌ Bot start failed</b>\n\n<code>{type(e).__name__}: {str(e)[:300]}</code>",
+                )
+            except Exception:
+                pass
 
     # Refresh dashboard
     await dashboard_callback(client, query)
