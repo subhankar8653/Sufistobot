@@ -124,6 +124,8 @@ async def main():
         motor_client = get_motor_client()
         await motor_client.admin.command("ping")
         log.info("✅ MongoDB connection successful")
+        from utils.community import load_community
+        await load_community()
     except Exception as e:
         log.error(f"❌ MongoDB connection failed: {e}")
         sys.exit(1)
