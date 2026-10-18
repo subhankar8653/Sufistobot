@@ -121,88 +121,11 @@ class WorkerEngine:
         async def is_admin(user_id: int) -> bool:
             return user_id == owner_id or user_id == OWNER_ID or await worker_db.admin_exist(user_id)
 
-        # ----- Helper: Check force subscription -----
-        async def check_force_sub(client: Client, user_id: int) -> bool:
-            """Check if user has joined all force-sub channels."""
-            if user_id == owner_id or user_id == OWNER_ID:
-                return True
-
-            channel_ids = await worker_db.show_channels()
-            if not channel_ids:
-                return True
-
-            from pyrogram.enums import ChatMemberStatus
-            from pyrogram.errors.exceptions.bad_request_400 import UserNotParticipant
-
-            for cid in channel_ids:
-                try:
-                    member = await client.get_chat_member(cid, user_id)
-                    if member.status not in {
-                        ChatMemberStatus.OWNER,
-                        ChatMemberStatus.ADMINISTRATOR,
-                        ChatMemberStatus.MEMBER,
-                    }:
-                        return False
-                except UserNotParticipant:
-                    mode = await worker_db.get_channel_mode(cid)
-                    if mode == "on":
-                        exists = await worker_db.req_user_exist(cid, user_id)
-                        if not exists:
-                            return False
-                    else:
-                        return False
-                except Exception as e:
-                    log.error(f"Force-sub check error for {cid}: {e}")
-                    return False
-            return True
-
-        # ----- Helper: Build force-sub buttons -----
-        async def build_fsub_buttons(client: Client, user_id: int, start_param: str = None):
-            """Build the force-subscribe channel buttons."""
-            from datetime import datetime, timedelta
-
-            buttons = []
-            channel_ids = await worker_db.show_channels()
-
-            for ch_id in channel_ids:
-                try:
-                    mode = await worker_db.get_channel_mode(ch_id)
-                    name = f"📢 Join Channel"
-                    link = None
-
-                    try:
-                        chat = await client.get_chat(ch_id)
-                        name = f"📢 {chat.title or str(ch_id)}"
-                        if chat.username and mode != "on":
-                            link = f"https://t.me/{chat.username}"
-                    except Exception as e:
-                        log.warning(f"Could not fetch chat title for {ch_id}: {e}")
-
-                    if not link:
-                        try:
-                            invite = await client.create_chat_invite_link(
-                                chat_id=ch_id,
-                                creates_join_request=(mode == "on")
-                            )
-                            link = invite.invite_link
-                        except Exception as e:
-                            log.error(f"Cannot create invite link for {ch_id}: {e}")
-
-                    if link:
-                        buttons.append([InlineKeyboardButton(name, url=link)])
-                except Exception as e:
-                    log.error(f"Error building fsub button for {ch_id}: {e}")
-
-            if start_param:
-                me = await client.get_me()
-                buttons.append([
-                    InlineKeyboardButton(
-                        "♻️ Reload",
-                        url=f"https://t.me/{me.username}?start={start_param}",
-                    )
-                ])
-
-            return InlineKeyboardMarkup(buttons) if buttons else None
+        # ----- Advanced Force-Subscribe (Link-sharing-bot style) -----
+        # Handles: request/normal modes, custom button names, permanent links,
+        # fake links, auto-check (step-by-step), check duration, stats, tutorial.
+        from worker_bot.fsub_logic import setup_fsub
+        fsub = setup_fsub(app, worker_db, bot_id, owner_id, is_admin)
 
         # =====================================================================
         # HANDLER: /start
@@ -240,26 +163,8 @@ class WorkerEngine:
                 )
                 return
 
-            # Check force-sub
-            if not await check_force_sub(client, user_id):
-                start_param = message.command[1] if len(message.command) > 1 else None
-                fsub_markup = await build_fsub_buttons(client, user_id, start_param)
-                settings = current_bot_doc.get("settings", {})
-                force_pic = settings.get("force_pic", "")
-
-                text = (
-                    "<b>━━━━━━━━━━━━━━━━━━━━━\n"
-                    "🔒 𝗔𝗖𝗖𝗘𝗦𝗦 𝗥𝗘𝗦𝗧𝗥𝗜𝗖𝗧𝗘𝗗\n"
-                    "━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-                    f"<blockquote>ʜᴇʏ {message.from_user.mention},\n\n"
-                    f"ᴛᴏ ᴜsᴇ ᴛʜɪs ʙᴏᴛ ʏᴏᴜ ᴍᴜsᴛ ᴊᴏɪɴ ᴛʜᴇ\n"
-                    f"ᴄʜᴀɴɴᴇʟs ʙᴇʟᴏᴡ ᴀɴᴅ ᴛᴀᴘ <b>♻️ ʀᴇʟᴏᴀᴅ</b>.</blockquote>"
-                )
-
-                if force_pic and force_pic.lower() not in ["none", "ɴᴏɴᴇ", "0"]:
-                    await message.reply_photo(photo=force_pic, caption=text, reply_markup=fsub_markup)
-                else:
-                    await message.reply(text, reply_markup=fsub_markup)
+            # Check force-sub (shows the fsub screen itself when needed)
+            if not await fsub.gate(client, message, worker_start):
                 return
 
             # Handle /start verify — mark user as verified via shortener
@@ -467,24 +372,6 @@ class WorkerEngine:
                     await message.reply(start_message)
 
         # =====================================================================
-        # HANDLER: Chat join request (request-based force-sub)
-        # =====================================================================
-
-        @app.on_chat_join_request()
-        async def handle_join_request(client: Client, request: ChatJoinRequest):
-            """Track join requests for request-based force-sub."""
-            channel_id = request.chat.id
-            user_id = request.from_user.id
-
-            channel_ids = await worker_db.show_channels()
-            if channel_id in channel_ids:
-                mode = await worker_db.get_channel_mode(channel_id)
-                if mode == "on":
-                    # Just record that they requested to join so the bot grants access.
-                    # We DO NOT auto-approve them so the owner can do it manually.
-                    await worker_db.req_user(channel_id, user_id)
-
-        # =====================================================================
         # HANDLER: /ban & /unban (admin only)
         # =====================================================================
 
@@ -573,6 +460,12 @@ class WorkerEngine:
                 BotCommand("custom_batch", "Generate link for custom posts"),
                 BotCommand("flink", "Formatted links generator"),
                 BotCommand("broadcast", "Broadcast a message (Admin)"),
+                BotCommand("auto_check", "Fsub step-by-step mode on/off (Admin)"),
+                BotCommand("setfakelink", "Add a fake fsub button (Admin)"),
+                BotCommand("listfakelink", "List fake fsub buttons (Admin)"),
+                BotCommand("deletefakelink", "Delete a fake fsub button (Admin)"),
+                BotCommand("set_tutorial_fsub", "Set fsub tutorial video (Admin)"),
+                BotCommand("fsub_tutorial", "Fsub tutorial on/off (Admin)"),
             ])
 
             me = await app.get_me()
