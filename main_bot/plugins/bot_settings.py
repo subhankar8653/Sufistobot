@@ -1,6 +1,7 @@
 #@suhanibots
 
 import re
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import (
     CallbackQuery,
@@ -237,8 +238,94 @@ async def handle_auto_delete_input(client: Client, message: Message, state: dict
 
 
 # =============================================================================
-# FORCE SUBSCRIBE
+# FORCE SUBSCRIBE  (Link-sharing-bot style panel)
 # =============================================================================
+
+from worker_bot.fsub_logic import FSUB_DURATION_OPTIONS, revoke_fsub_link
+
+
+async def _worker_client(bot_id: int):
+    """Running worker Client for this bot (or None)."""
+    try:
+        from worker_bot.engine import worker_engine
+        return worker_engine.get_worker(bot_id)
+    except Exception:
+        return None
+
+
+async def _channel_title(bot_id: int, ch_id: int) -> str:
+    wc = await _worker_client(bot_id)
+    if wc:
+        try:
+            chat = await wc.get_chat(ch_id)
+            return chat.title or str(ch_id)
+        except Exception:
+            pass
+    return str(ch_id)
+
+
+async def _safe_edit(query: CallbackQuery, text: str, markup=None):
+    try:
+        await query.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    except Exception as e:
+        if "MESSAGE_NOT_MODIFIED" not in str(e).upper():
+            log.error(f"fsub panel edit failed: {e}")
+
+
+def _duration_text(hours: int) -> str:
+    return "7 Days" if hours == 168 else f"{hours} Hours"
+
+
+async def _show_fsub_menu(query: CallbackQuery, bot_id: int):
+    """Main force-subscribe menu."""
+    worker_db = WorkerDB(bot_id)
+    channels = await worker_db.show_channels()
+    auto_on = await worker_db.get_auto_check()
+    dur = await worker_db.get_fsub_check_duration()
+
+    if channels:
+        channel_list = ""
+        for i, ch_id in enumerate(channels, 1):
+            mode = await worker_db.get_channel_mode(ch_id)
+            mode_text = "📩 Request" if mode == "on" else "🔒 Normal"
+            stats = await worker_db.get_fsub_stats(ch_id)
+            name = await worker_db.get_channel_name(ch_id)
+            channel_list += f"  {i}. <code>{ch_id}</code> — {mode_text}\n"
+            if name:
+                channel_list += f"      ✏️ {name}\n"
+            channel_list += f"      👥 {stats['join_count']} joined | 📥 {stats['request_count']} requests\n"
+    else:
+        channel_list = "  <i>No channels added</i>\n"
+
+    dur_line = (
+        f"ON — {_duration_text(dur['hours'])}" if dur["enabled"] and dur["hours"] else "OFF"
+    )
+
+    await _safe_edit(
+        query,
+        f"<b>🔗 Force Subscribe Settings</b>\n\n"
+        f"<blockquote><b>Channels:</b>\n{channel_list}</blockquote>\n"
+        f"<blockquote>🤖 <b>Auto Check:</b> {'ON' if auto_on else 'OFF'}\n"
+        f"⏱ <b>Check Duration:</b> {dur_line}</blockquote>",
+        InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("➕ Add Channel", callback_data=f"add_fsub_{bot_id}"),
+                InlineKeyboardButton("➖ Remove Channel", callback_data=f"rem_fsub_{bot_id}"),
+            ],
+            [
+                InlineKeyboardButton("📋 List Channels", callback_data=f"fsublist_{bot_id}"),
+                InlineKeyboardButton("✏️ Rename Button", callback_data=f"fsubren_{bot_id}"),
+            ],
+            [InlineKeyboardButton("🔄 Mode (Request / Normal)", callback_data=f"toggle_fsub_{bot_id}")],
+            [InlineKeyboardButton("⏱ Check Duration", callback_data=f"fsubdur_{bot_id}")],
+            [InlineKeyboardButton(
+                f"🤖 Auto Check: {'ON ✅' if auto_on else 'OFF ❌'}",
+                callback_data=f"fsubauto_{bot_id}",
+            )],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"dashboard_{bot_id}")],
+        ]),
+    )
+
 
 @Client.on_callback_query(filters.regex(r"^fsub_(\d+)$"))
 async def fsub_callback(client: Client, query: CallbackQuery):
@@ -247,33 +334,12 @@ async def fsub_callback(client: Client, query: CallbackQuery):
     bot = await _verify_ownership(query, bot_id)
     if not bot:
         return
-
     _get_state().pop(query.from_user.id, None)
-
-    worker_db = WorkerDB(bot_id)
-    channels = await worker_db.show_channels()
-
-    if channels:
-        channel_list = ""
-        for i, ch_id in enumerate(channels, 1):
-            mode = await worker_db.get_channel_mode(ch_id)
-            mode_text = "📩 Request" if mode == "on" else "🔒 Force Join"
-            channel_list += f"  {i}. <code>{ch_id}</code> — {mode_text}\n"
-    else:
-        channel_list = "  <i>No channels added</i>\n"
-
-    await query.message.edit_text(
-        f"<b>🔗 Force Subscribe Settings</b>\n\n"
-        f"<blockquote><b>Current Channels:</b>\n{channel_list}</blockquote>",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add Channel", callback_data=f"add_fsub_{bot_id}")],
-            [InlineKeyboardButton("➖ Remove Channel", callback_data=f"rem_fsub_{bot_id}")],
-            [InlineKeyboardButton("🔄 Toggle Mode", callback_data=f"toggle_fsub_{bot_id}")],
-            [InlineKeyboardButton("🔙 Back", callback_data=f"dashboard_{bot_id}")],
-        ]),
-    )
+    await _show_fsub_menu(query, bot_id)
     await query.answer()
 
+
+# ---- Add channel -----------------------------------------------------------
 
 @Client.on_callback_query(filters.regex(r"^add_fsub_(\d+)$"))
 async def add_fsub_callback(client: Client, query: CallbackQuery):
@@ -292,7 +358,9 @@ async def add_fsub_callback(client: Client, query: CallbackQuery):
     await query.message.edit_text(
         "<b>➕ Add Force Subscribe Channel</b>\n\n"
         f"<blockquote>Send the channel ID.\n"
-        f"Make sure @{bot.get('bot_username', '')} is an admin in the channel.\n\n"
+        f"Make sure @{bot.get('bot_username', '')} is an admin in the channel "
+        f"with <b>Invite Users via Link</b> permission.\n\n"
+        f"New channels are added in <b>Request mode</b> — you can switch to Normal in the Mode menu.\n\n"
         f"Example: <code>-1001234567890</code></blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"fsub_{bot_id}")],
@@ -300,6 +368,8 @@ async def add_fsub_callback(client: Client, query: CallbackQuery):
     )
     await query.answer()
 
+
+# ---- Remove channel --------------------------------------------------------
 
 @Client.on_callback_query(filters.regex(r"^rem_fsub_(\d+)$"))
 async def rem_fsub_callback(client: Client, query: CallbackQuery):
@@ -311,24 +381,19 @@ async def rem_fsub_callback(client: Client, query: CallbackQuery):
 
     worker_db = WorkerDB(bot_id)
     channels = await worker_db.show_channels()
-
     if not channels:
         await query.answer("No channels to remove!", show_alert=True)
         return
 
-    buttons = []
-    for ch_id in channels:
-        buttons.append([
-            InlineKeyboardButton(
-                f"🗑 {ch_id}",
-                callback_data=f"do_rem_fsub_{bot_id}_{ch_id}",
-            )
-        ])
+    titles = await asyncio.gather(*[_channel_title(bot_id, c) for c in channels])
+    buttons = [
+        [InlineKeyboardButton(f"🗑 {t}", callback_data=f"do_rem_fsub_{bot_id}_{c}")]
+        for c, t in zip(channels, titles)
+    ]
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")])
 
     await query.message.edit_text(
-        "<b>➖ Remove Channel</b>\n\n"
-        "<blockquote>Select a channel to remove:</blockquote>",
+        "<b>➖ Remove Channel</b>\n\n<blockquote>Select a channel to remove:</blockquote>",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     await query.answer()
@@ -336,7 +401,7 @@ async def rem_fsub_callback(client: Client, query: CallbackQuery):
 
 @Client.on_callback_query(filters.regex(r"^do_rem_fsub_(\d+)_(-?\d+)$"))
 async def do_rem_fsub_callback(client: Client, query: CallbackQuery):
-    """Remove a force-sub channel."""
+    """Remove a force-sub channel (and revoke its permanent invite link)."""
     match = re.match(r"^do_rem_fsub_(\d+)_(-?\d+)$", query.data)
     bot_id, channel_id = int(match.group(1)), int(match.group(2))
 
@@ -345,51 +410,102 @@ async def do_rem_fsub_callback(client: Client, query: CallbackQuery):
         return
 
     worker_db = WorkerDB(bot_id)
+    await revoke_fsub_link(await _worker_client(bot_id), worker_db, channel_id)
     await worker_db.rem_channel(channel_id)
 
     await query.answer(f"✅ Channel {channel_id} removed!", show_alert=True)
-    await fsub_callback(client, query)
+    await _show_fsub_menu(query, bot_id)
 
 
-@Client.on_callback_query(filters.regex(r"^toggle_fsub_(\d+)$"))
-async def toggle_fsub_callback(client: Client, query: CallbackQuery):
-    """Show channels to toggle mode."""
-    bot_id = _extract_bot_id(r"^toggle_fsub_(\d+)$", query.data)
+# ---- List channels (with stats) -------------------------------------------
+
+@Client.on_callback_query(filters.regex(r"^fsublist_(\d+)$"))
+async def fsub_list_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsublist_(\d+)$", query.data)
     bot = await _verify_ownership(query, bot_id)
     if not bot:
         return
 
     worker_db = WorkerDB(bot_id)
     channels = await worker_db.show_channels()
-
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")]])
     if not channels:
-        await query.answer("No channels added!", show_alert=True)
+        await _safe_edit(query, "<b>No fsub channels added yet.</b>", back)
+        await query.answer()
         return
 
-    buttons = []
-    for ch_id in channels:
+    await query.answer("Fetching channels...")
+    titles = await asyncio.gather(*[_channel_title(bot_id, c) for c in channels])
+
+    text = "<b>📋 Fsub Channels List</b>\n\n"
+    for i, (ch_id, title) in enumerate(zip(channels, titles), 1):
         mode = await worker_db.get_channel_mode(ch_id)
-        mode_text = "Request → Force Join" if mode == "on" else "Force Join → Request"
-        buttons.append([
-            InlineKeyboardButton(
-                f"🔄 {ch_id} ({mode_text})",
-                callback_data=f"do_toggle_{bot_id}_{ch_id}",
-            )
-        ])
+        stats = await worker_db.get_fsub_stats(ch_id)
+        link = await worker_db.get_invite_link(ch_id)
+        shown = f"<a href='{link['invite_link']}'>{title}</a>" if link else title
+        text += (
+            f"{i}. {shown}\n"
+            f"    <code>{ch_id}</code> — {'📩 Request ON' if mode == 'on' else '🔒 Request OFF (Normal)'}\n"
+            f"    👥 Joined: <b>{stats['join_count']}</b> | 📥 Requests: <b>{stats['request_count']}</b>\n\n"
+        )
+    text += f"<b>Total Fsub Channels: {len(channels)}</b>"
+    await _safe_edit(query, text, back)
+
+
+# ---- Mode: per channel + all ----------------------------------------------
+
+async def _show_mode_menu(query: CallbackQuery, bot_id: int):
+    worker_db = WorkerDB(bot_id)
+    channels = await worker_db.show_channels()
+    if not channels:
+        await query.answer("No channels added!", show_alert=True)
+        return False
+
+    titles = await asyncio.gather(*[_channel_title(bot_id, c) for c in channels])
+    buttons = []
+    for ch_id, title in zip(channels, titles):
+        mode = await worker_db.get_channel_mode(ch_id)
+        label = "Request ✅" if mode == "on" else "Normal ⭕️"
+        buttons.append([InlineKeyboardButton(f"{title}", callback_data=f"fsubinfo_{bot_id}")])
+        buttons.append([InlineKeyboardButton(
+            f"Mode: {label}  (tap to switch)", callback_data=f"do_toggle_{bot_id}_{ch_id}"
+        )])
+    buttons.append([
+        InlineKeyboardButton("📩 All → Request", callback_data=f"modeall_{bot_id}_on"),
+        InlineKeyboardButton("🔒 All → Normal", callback_data=f"modeall_{bot_id}_off"),
+    ])
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")])
 
-    await query.message.edit_text(
-        "<b>🔄 Toggle Channel Mode</b>\n\n"
-        "<blockquote><b>Force Join:</b> User must join the channel.\n"
-        "<b>Request:</b> User sends a join request.</blockquote>",
-        reply_markup=InlineKeyboardMarkup(buttons),
+    await _safe_edit(
+        query,
+        "<b>🔄 Channel Mode</b>\n\n"
+        "<blockquote><b>Request:</b> user sends a join request (you approve manually).\n"
+        "<b>Normal:</b> user must join the channel directly.\n\n"
+        "Each channel's mode is separate — switching one never affects another.</blockquote>",
+        InlineKeyboardMarkup(buttons),
     )
-    await query.answer()
+    return True
+
+
+@Client.on_callback_query(filters.regex(r"^fsubinfo_(\d+)$"))
+async def fsub_info_callback(client: Client, query: CallbackQuery):
+    await query.answer("Tap the Mode button below the channel name to switch.", show_alert=False)
+
+
+@Client.on_callback_query(filters.regex(r"^toggle_fsub_(\d+)$"))
+async def toggle_fsub_callback(client: Client, query: CallbackQuery):
+    """Show per-channel mode menu."""
+    bot_id = _extract_bot_id(r"^toggle_fsub_(\d+)$", query.data)
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+    if await _show_mode_menu(query, bot_id):
+        await query.answer()
 
 
 @Client.on_callback_query(filters.regex(r"^do_toggle_(\d+)_(-?\d+)$"))
 async def do_toggle_fsub_callback(client: Client, query: CallbackQuery):
-    """Toggle a channel's force-sub mode."""
+    """Toggle ONE channel's mode (Request <-> Normal)."""
     match = re.match(r"^do_toggle_(\d+)_(-?\d+)$", query.data)
     bot_id, channel_id = int(match.group(1)), int(match.group(2))
 
@@ -402,10 +518,214 @@ async def do_toggle_fsub_callback(client: Client, query: CallbackQuery):
     new_mode = "off" if current == "on" else "on"
     await worker_db.set_channel_mode(channel_id, new_mode)
 
-    mode_name = "Request-based" if new_mode == "on" else "Force Join"
-    await query.answer(f"✅ Channel set to {mode_name}!", show_alert=True)
-    await fsub_callback(client, query)
+    await query.answer(
+        f"✅ Channel set to {'Request' if new_mode == 'on' else 'Normal'} mode!"
+    )
+    await _show_mode_menu(query, bot_id)
 
+
+@Client.on_callback_query(filters.regex(r"^modeall_(\d+)_(on|off)$"))
+async def mode_all_callback(client: Client, query: CallbackQuery):
+    """Set ALL channels to Request / Normal in one tap."""
+    match = re.match(r"^modeall_(\d+)_(on|off)$", query.data)
+    bot_id, mode = int(match.group(1)), match.group(2)
+
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+
+    count = await WorkerDB(bot_id).set_channel_mode_all(mode)
+    await query.answer(
+        f"✅ {count} channel(s) set to {'Request' if mode == 'on' else 'Normal'} mode!",
+        show_alert=True,
+    )
+    await _show_mode_menu(query, bot_id)
+
+
+# ---- Check duration (cooldown) --------------------------------------------
+
+async def _show_duration_menu(query: CallbackQuery, bot_id: int):
+    worker_db = WorkerDB(bot_id)
+    cfg = await worker_db.get_fsub_check_duration()
+    enabled, hours = cfg["enabled"], cfg["hours"]
+
+    buttons = [[InlineKeyboardButton(
+        f"Status: {'✅ ON' if enabled else '❌ OFF'}  (tap to switch)",
+        callback_data=f"fsubdurtog_{bot_id}",
+    )]]
+    row = []
+    for label, hrs in FSUB_DURATION_OPTIONS:
+        mark = " ✅" if (enabled and hours == hrs) else ""
+        row.append(InlineKeyboardButton(f"{label}{mark}", callback_data=f"fsubdurset_{bot_id}_{hrs}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")])
+
+    status_line = (
+        f"Now: <b>ON</b> — {_duration_text(hours)}"
+        if enabled and hours else "Now: <b>OFF</b> (full fsub check every time)"
+    )
+    await _safe_edit(
+        query,
+        "<b>⏱ Fsub Check Duration</b>\n\n"
+        "<blockquote>Once a user passes the fsub check, they won't be re-checked for this "
+        "duration — even if you add a NEW fsub channel in the meantime.\n\n"
+        f"{status_line}</blockquote>",
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^fsubdur_(\d+)$"))
+async def fsub_duration_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubdur_(\d+)$", query.data)
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+    await _show_duration_menu(query, bot_id)
+    await query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^fsubdurtog_(\d+)$"))
+async def fsub_duration_toggle_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubdurtog_(\d+)$", query.data)
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+    worker_db = WorkerDB(bot_id)
+    cfg = await worker_db.get_fsub_check_duration()
+    new_enabled = not cfg["enabled"]
+    hours = cfg["hours"] or 24  # default to 24h the first time it is switched ON
+    await worker_db.set_fsub_check_duration(new_enabled, hours)
+    await query.answer(f"Check Duration {'ON' if new_enabled else 'OFF'}")
+    await _show_duration_menu(query, bot_id)
+
+
+@Client.on_callback_query(filters.regex(r"^fsubdurset_(\d+)_(\d+)$"))
+async def fsub_duration_set_callback(client: Client, query: CallbackQuery):
+    match = re.match(r"^fsubdurset_(\d+)_(\d+)$", query.data)
+    bot_id, hours = int(match.group(1)), int(match.group(2))
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+    if hours not in [h for _, h in FSUB_DURATION_OPTIONS]:
+        await query.answer("Invalid duration.", show_alert=True)
+        return
+    await WorkerDB(bot_id).set_fsub_check_duration(True, hours)
+    await query.answer(f"✅ Check Duration set to {_duration_text(hours)}")
+    await _show_duration_menu(query, bot_id)
+
+
+# ---- Auto check (step-by-step) toggle --------------------------------------
+
+@Client.on_callback_query(filters.regex(r"^fsubauto_(\d+)$"))
+async def fsub_auto_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubauto_(\d+)$", query.data)
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+    worker_db = WorkerDB(bot_id)
+    new_val = not await worker_db.get_auto_check()
+    await worker_db.set_auto_check(new_val)
+    await query.answer(
+        "✅ Auto Check ON — users see one channel at a time, next step appears automatically."
+        if new_val else
+        "✅ Auto Check OFF — all channels are shown at once.",
+        show_alert=True,
+    )
+    await _show_fsub_menu(query, bot_id)
+
+
+# ---- Rename channel button -------------------------------------------------
+
+@Client.on_callback_query(filters.regex(r"^fsubren_(\d+)$"))
+async def fsub_rename_list_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubren_(\d+)$", query.data)
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+
+    worker_db = WorkerDB(bot_id)
+    channels = await worker_db.show_channels()
+    if not channels:
+        await query.answer("No channels added!", show_alert=True)
+        return
+
+    titles = await asyncio.gather(*[_channel_title(bot_id, c) for c in channels])
+    buttons = []
+    for ch_id, title in zip(channels, titles):
+        name = await worker_db.get_channel_name(ch_id)
+        shown = f"{title} → {name}" if name else title
+        buttons.append([InlineKeyboardButton(f"✏️ {shown}"[:60], callback_data=f"fsubrenc_{bot_id}_{ch_id}")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")])
+
+    await _safe_edit(
+        query,
+        "<b>✏️ Rename Fsub Button</b>\n\n"
+        "<blockquote>Select a channel to set a custom button name.\n"
+        "Default names are <code>⚡ Join channel 01 ⚡</code> / <code>⚡ Request channel 01 ⚡</code>.</blockquote>",
+        InlineKeyboardMarkup(buttons),
+    )
+    await query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^fsubrenc_(\d+)_(-?\d+)$"))
+async def fsub_rename_choose_callback(client: Client, query: CallbackQuery):
+    match = re.match(r"^fsubrenc_(\d+)_(-?\d+)$", query.data)
+    bot_id, channel_id = int(match.group(1)), int(match.group(2))
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+
+    _get_state()[query.from_user.id] = {
+        "step": "awaiting_fsub_rename",
+        "data": {"bot_id": bot_id, "channel_id": channel_id},
+    }
+    await query.message.edit_text(
+        "<b>✏️ Send the new button name</b>\n\n"
+        f"<blockquote>Channel: <code>{channel_id}</code>\n\n"
+        "Example: <code>📢 Main Channel</code>\n"
+        "Send <code>reset</code> to go back to the default numbered name.</blockquote>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"fsub_{bot_id}")],
+        ]),
+    )
+    await query.answer()
+
+
+async def handle_fsub_rename_input(client: Client, message: Message, state: dict):
+    """Process the new custom button name."""
+    user_id = message.from_user.id
+    bot_id = state["data"]["bot_id"]
+    channel_id = state["data"]["channel_id"]
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply("<b>❌ Send the name as text.</b>")
+        return
+    if len(text) > 60:
+        await message.reply("<b>❌ Too long! Keep it under 60 characters.</b>")
+        return
+
+    worker_db = WorkerDB(bot_id)
+    reset = text.lower() in ("reset", "/reset")
+    ok = await worker_db.set_channel_name(channel_id, "" if reset else text)
+    _get_state().pop(user_id, None)
+
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")]])
+    if not ok:
+        await message.reply("<b>❌ That channel is not in the fsub list.</b>", reply_markup=back)
+        return
+    await message.reply(
+        "<b>✅ Button name reset to default!</b>" if reset
+        else f"<b>✅ Button name set to:</b> {text}",
+        reply_markup=back,
+    )
+
+
+# ---- Channel ID input (add) -------------------------------------------------
 
 async def handle_fsub_channel_input(client: Client, message: Message, state: dict):
     """Process force-sub channel ID input."""
@@ -416,6 +736,17 @@ async def handle_fsub_channel_input(client: Client, message: Message, state: dic
         channel_id = int(message.text.strip())
     except ValueError:
         await message.reply("<b>❌ Invalid channel ID. Send a number like <code>-1001234567890</code></b>")
+        return
+
+    worker_db = WorkerDB(bot_id)
+    back_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")]])
+
+    if await worker_db.channel_exist(channel_id):
+        _get_state().pop(user_id, None)
+        await message.reply(
+            f"<b>⚠️ Channel <code>{channel_id}</code> is already in the fsub list.</b>",
+            reply_markup=back_markup,
+        )
         return
 
     status_msg = await message.reply("<b>⏳ Verifying channel access...</b>")
@@ -433,17 +764,17 @@ async def handle_fsub_channel_input(client: Client, message: Message, state: dic
             in_memory=True
         )
         await temp_client.start()
-        
+
         # 1. Check access
         chat = await temp_client.get_chat(channel_id)
-        
+
         # 2. Check ability to create join request links (needed for request mode)
         invite = await temp_client.create_chat_invite_link(
             chat_id=channel_id,
             creates_join_request=True
         )
         await temp_client.revoke_chat_invite_link(channel_id, invite.invite_link)
-        
+
         await temp_client.stop()
     except Exception as e:
         await status_msg.edit_text(
@@ -453,15 +784,13 @@ async def handle_fsub_channel_input(client: Client, message: Message, state: dic
             f"2. The bot (@{bot.get('bot_username', 'unknown')}) is an admin in the channel\n"
             f"3. The bot has 'Invite Users via Link' admin rights\n\n"
             f"<b>Error:</b> <code>{str(e)[:100]}</code></blockquote>",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")],
-            ])
+            reply_markup=back_markup,
         )
         return
 
-    worker_db = WorkerDB(bot_id)
-    await worker_db.add_channel(channel_id, mode="off")
-    
+    # New channels start in REQUEST mode (like Link-sharing-bot)
+    await worker_db.add_channel(channel_id)
+
     # Restart the worker bot to ensure it caches this new chat
     try:
         from worker_bot.engine import worker_engine
@@ -474,10 +803,9 @@ async def handle_fsub_channel_input(client: Client, message: Message, state: dic
     creation_state.pop(user_id, None)
 
     await status_msg.edit_text(
-        f"<b>✅ Channel <code>{channel_id}</code> added with Force Join mode!</b>",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")],
-        ]),
+        f"<b>✅ Channel <code>{channel_id}</code> added in Request mode!</b>\n\n"
+        f"<blockquote>Switch to Normal join anytime from the Mode menu.</blockquote>",
+        reply_markup=back_markup,
     )
 
 

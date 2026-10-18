@@ -334,6 +334,13 @@ async def handle_creation_input(client: Client, message: Message):
         await handle_fsub_channel_input(client, message, state)
 
     # -------------------------------------------------------------------------
+    # STEP: Awaiting fsub custom button name (from bot_settings.py)
+    # -------------------------------------------------------------------------
+    elif step == "awaiting_fsub_rename":
+        from main_bot.plugins.bot_settings import handle_fsub_rename_input
+        await handle_fsub_rename_input(client, message, state)
+
+    # -------------------------------------------------------------------------
     # STEP: Awaiting admin ID (from bot_settings.py)
     # -------------------------------------------------------------------------
     elif step == "awaiting_admin_id":
