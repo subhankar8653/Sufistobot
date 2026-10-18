@@ -25,6 +25,10 @@ class WorkerDB:
         self.request_fsub = db[f"{prefix}_request_fsub"]
         self.del_timer = db[f"{prefix}_del_timer"]
         self.verify = db[f"{prefix}_verify"]
+        # FSub extras (Link-sharing-bot style)
+        self.fsub_cfg = db[f"{prefix}_fsub_cfg"]          # auto_check / check_duration settings
+        self.fake_links = db[f"{prefix}_fake_links"]      # fake (extra) buttons shown on fsub screen
+        self.tutorials = db[f"{prefix}_tutorials"]        # fsub tutorial video
 
     # =========================================================================
     # USER TRACKING
@@ -115,26 +119,46 @@ class WorkerDB:
 
     # =========================================================================
     # FORCE-SUBSCRIBE CHANNEL MANAGEMENT
+    # Channel doc: {_id, mode, created_at, custom_name, join_count,
+    #               request_count, invite_link, invite_is_request}
+    # mode: 'on' = request-based (join request), 'off' = normal force join
     # =========================================================================
 
     async def channel_exist(self, channel_id: int) -> bool:
         """Check if a force-sub channel exists."""
         return bool(await self.channels.find_one({"_id": channel_id}))
 
-    async def add_channel(self, channel_id: int, mode: str = "off"):
-        """Add a force-sub channel. Mode: 'off' = force join, 'on' = request-based."""
+    async def add_channel(self, channel_id: int, mode: str = "on", custom_name: str = None):
+        """Add a force-sub channel.
+
+        New channels are added in REQUEST mode ('on') by default (same as
+        Link-sharing-bot). Use set_channel_mode() to switch to normal join ('off').
+        """
         if not await self.channel_exist(channel_id):
-            await self.channels.insert_one({"_id": channel_id, "mode": mode})
+            from datetime import datetime
+            doc = {
+                "_id": channel_id,
+                "mode": mode,
+                "created_at": datetime.utcnow(),
+                "join_count": 0,
+                "request_count": 0,
+            }
+            if custom_name:
+                doc["custom_name"] = custom_name.strip()
+            await self.channels.insert_one(doc)
 
     async def rem_channel(self, channel_id: int):
-        """Remove a force-sub channel."""
+        """Remove a force-sub channel (and its request-tracking data)."""
         await self.channels.delete_one({"_id": channel_id})
-        # Also clean up request data for this channel
         await self.request_fsub.delete_one({"_id": channel_id})
 
     async def show_channels(self) -> list:
-        """Return all force-sub channel IDs."""
-        docs = await self.channels.find().to_list(length=None)
+        """Return all force-sub channel IDs, oldest-added first.
+
+        Order is stable (created_at) so default button names
+        (Join channel 01, 02, ...) never shuffle.
+        """
+        docs = await self.channels.find().sort("created_at", 1).to_list(length=None)
         return [doc["_id"] for doc in docs]
 
     async def get_channel_mode(self, channel_id: int) -> str:
@@ -148,6 +172,68 @@ class WorkerDB:
             {"_id": channel_id},
             {"$set": {"mode": mode}},
             upsert=True,
+        )
+
+    async def set_channel_mode_all(self, mode: str) -> int:
+        """Set mode for ALL fsub channels at once. Returns number of channels matched."""
+        if mode not in ("on", "off"):
+            return 0
+        result = await self.channels.update_many({}, {"$set": {"mode": mode}})
+        return result.matched_count
+
+    # ---- custom button name ----
+
+    async def set_channel_name(self, channel_id: int, custom_name: str) -> bool:
+        """Set a custom button name for a fsub channel (empty string clears it)."""
+        custom_name = (custom_name or "").strip()
+        if custom_name:
+            res = await self.channels.update_one({"_id": channel_id}, {"$set": {"custom_name": custom_name}})
+        else:
+            res = await self.channels.update_one({"_id": channel_id}, {"$unset": {"custom_name": ""}})
+        return res.matched_count > 0
+
+    async def get_channel_name(self, channel_id: int):
+        """Custom button name of a fsub channel (None if not set)."""
+        data = await self.channels.find_one({"_id": channel_id})
+        return data.get("custom_name") if data else None
+
+    # ---- join / request stats ----
+
+    async def inc_join_count(self, channel_id: int):
+        await self.channels.update_one({"_id": channel_id}, {"$inc": {"join_count": 1}})
+
+    async def inc_request_count(self, channel_id: int):
+        await self.channels.update_one({"_id": channel_id}, {"$inc": {"request_count": 1}})
+
+    async def get_fsub_stats(self, channel_id: int) -> dict:
+        data = await self.channels.find_one({"_id": channel_id})
+        return {
+            "join_count": data.get("join_count", 0) if data else 0,
+            "request_count": data.get("request_count", 0) if data else 0,
+        }
+
+    # ---- permanent (non-expiring) invite link cache ----
+
+    async def get_invite_link(self, channel_id: int):
+        """Return {'invite_link': str, 'is_request': bool} or None."""
+        data = await self.channels.find_one({"_id": channel_id})
+        if data and data.get("invite_link"):
+            return {
+                "invite_link": data["invite_link"],
+                "is_request": bool(data.get("invite_is_request", False)),
+            }
+        return None
+
+    async def save_invite_link(self, channel_id: int, invite_link: str, is_request: bool):
+        await self.channels.update_one(
+            {"_id": channel_id},
+            {"$set": {"invite_link": invite_link, "invite_is_request": bool(is_request)}},
+        )
+
+    async def clear_invite_link(self, channel_id: int):
+        await self.channels.update_one(
+            {"_id": channel_id},
+            {"$unset": {"invite_link": "", "invite_is_request": ""}},
         )
 
     # =========================================================================
@@ -168,8 +254,8 @@ class WorkerDB:
     async def del_req_user(self, channel_id: int, user_id: int):
         """Remove a user from the join request list for a channel."""
         await self.request_fsub.update_one(
-            {"_id": channel_id},
-            {"$pull": {"user_ids": user_id}},
+            {"_id": int(channel_id)},
+            {"$pull": {"user_ids": int(user_id)}},
         )
 
     async def req_user_exist(self, channel_id: int, user_id: int) -> bool:
@@ -182,6 +268,122 @@ class WorkerDB:
         except Exception as e:
             log.error(f"Failed to check request list: {e}")
             return False
+
+    # =========================================================================
+    # FSUB SMART AUTO-CHECK  (OFF by default)
+    # ON -> step-by-step fsub, one channel at a time, auto-advances on join.
+    # =========================================================================
+
+    async def get_auto_check(self) -> bool:
+        doc = await self.fsub_cfg.find_one({"_id": "auto_check"})
+        return bool(doc.get("enabled", False)) if doc else False
+
+    async def set_auto_check(self, enabled: bool):
+        await self.fsub_cfg.update_one(
+            {"_id": "auto_check"}, {"$set": {"enabled": bool(enabled)}}, upsert=True
+        )
+
+    # =========================================================================
+    # FSUB CHECK DURATION (cooldown)  (OFF by default)
+    # ON + hours -> once a user passes fsub, no re-check for that many hours,
+    # even if new fsub channels get added.
+    # =========================================================================
+
+    async def get_fsub_check_duration(self) -> dict:
+        doc = await self.fsub_cfg.find_one({"_id": "check_duration"})
+        if not doc:
+            return {"enabled": False, "hours": 0}
+        return {"enabled": bool(doc.get("enabled", False)), "hours": int(doc.get("hours", 0) or 0)}
+
+    async def set_fsub_check_duration(self, enabled: bool, hours: int = 0):
+        await self.fsub_cfg.update_one(
+            {"_id": "check_duration"},
+            {"$set": {"enabled": bool(enabled), "hours": int(hours)}},
+            upsert=True,
+        )
+
+    async def set_fsub_verified(self, user_id: int):
+        """Save the time this user last passed the full fsub check."""
+        from datetime import datetime
+        await self.users.update_one(
+            {"_id": int(user_id)}, {"$set": {"fsub_verified_at": datetime.utcnow()}}
+        )
+
+    async def get_fsub_verified_at(self, user_id: int):
+        user = await self.users.find_one({"_id": int(user_id)})
+        return user.get("fsub_verified_at") if user else None
+
+    # =========================================================================
+    # FAKE LINKS (extra custom buttons on the fsub screen, with row position)
+    # =========================================================================
+
+    async def add_fake_link(self, url: str, button_text: str, row: int = 1) -> bool:
+        try:
+            last = await self.fake_links.find_one(sort=[("order", -1)])
+            order = (last["order"] + 1) if last else 1
+            await self.fake_links.insert_one(
+                {"url": url, "button_text": button_text, "row": int(row), "order": order}
+            )
+            return True
+        except Exception as e:
+            log.error(f"add_fake_link error: {e}")
+            return False
+
+    async def get_fake_links(self) -> list:
+        try:
+            links = []
+            async for doc in self.fake_links.find().sort("order", 1):
+                links.append({
+                    "url": doc["url"],
+                    "button_text": doc["button_text"],
+                    "row": doc.get("row", 1),
+                })
+            return links
+        except Exception as e:
+            log.error(f"get_fake_links error: {e}")
+            return []
+
+    async def remove_fake_link_by_index(self, index: int) -> bool:
+        """index is 1-based, as shown in /listfakelink."""
+        try:
+            docs = await self.fake_links.find().sort("order", 1).to_list(length=None)
+            if index < 1 or index > len(docs):
+                return False
+            res = await self.fake_links.delete_one({"_id": docs[index - 1]["_id"]})
+            return res.deleted_count > 0
+        except Exception as e:
+            log.error(f"remove_fake_link_by_index error: {e}")
+            return False
+
+    # =========================================================================
+    # FSUB TUTORIAL VIDEO
+    # =========================================================================
+
+    async def set_tutorial(self, tutorial_type: str, file_id: str):
+        await self.tutorials.update_one(
+            {"_id": tutorial_type},
+            {"$set": {"file_id": file_id, "enabled": True}},
+            upsert=True,
+        )
+
+    async def get_tutorial(self, tutorial_type: str):
+        """Return {'file_id': ...} if set AND enabled, else None."""
+        doc = await self.tutorials.find_one({"_id": tutorial_type})
+        if doc and doc.get("enabled", False) and doc.get("file_id"):
+            return {"file_id": doc["file_id"]}
+        return None
+
+    async def toggle_tutorial(self, tutorial_type: str, enabled: bool) -> bool:
+        res = await self.tutorials.update_one(
+            {"_id": tutorial_type}, {"$set": {"enabled": bool(enabled)}}
+        )
+        return res.matched_count > 0
+
+    async def get_tutorial_status(self, tutorial_type: str) -> dict:
+        doc = await self.tutorials.find_one({"_id": tutorial_type})
+        if not doc:
+            return {"exists": False, "enabled": False}
+        return {"exists": True, "enabled": bool(doc.get("enabled", False))}
 
     # =========================================================================
     # SHORTENER VERIFICATION TRACKING
