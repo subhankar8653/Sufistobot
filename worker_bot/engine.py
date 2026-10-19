@@ -555,6 +555,12 @@ class WorkerEngine:
 
         if app:
             try:
+                fsub_mgr = getattr(app, "_fsub_mgr", None)
+                if fsub_mgr:
+                    fsub_mgr.stop()   # cancel fsub maintenance / auto-check tasks
+            except Exception:
+                pass
+            try:
                 # Prevent app.stop() from hanging forever if there's a connection issue
                 await asyncio.wait_for(app.stop(block=False), timeout=3.0)
                 log.info(f"Worker stopped: {bot_id}")

@@ -19,6 +19,7 @@ Everything is per worker bot (isolated through WorkerDB).
 """
 
 import asyncio
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -34,6 +35,7 @@ from pyrogram.types import (
     Message,
 )
 
+import config as _cfg
 from config import LOGGER, OWNER_ID
 from database.main_db import MainDB
 
@@ -61,6 +63,60 @@ FSUB_DURATION_OPTIONS = [
     ("48 Hours", 48),
     ("7 Days", 168),
 ]
+
+
+def tz_offset() -> timedelta:
+    return timedelta(minutes=int(getattr(_cfg, "FSUB_TZ_OFFSET_MIN", 330)))
+
+
+def tz_label() -> str:
+    mins = int(getattr(_cfg, "FSUB_TZ_OFFSET_MIN", 330))
+    sign = "+" if mins >= 0 else "-"
+    return f"UTC{sign}{abs(mins) // 60:02d}:{abs(mins) % 60:02d}"
+
+
+def fmt_local(dt_utc: datetime) -> str:
+    """Naive-UTC datetime -> readable local time (FSUB_TZ_OFFSET_MIN)."""
+    return (dt_utc + tz_offset()).strftime("%d %b %Y, %I:%M %p")
+
+
+def parse_remove_time(text: str):
+    """Parse owner input into a naive-UTC datetime (or None if unreadable / in the past).
+
+    Accepts:  6h | 1d 12h | 90m          (from now)
+              12:00 | 6:30 pm            (next time it is that clock time, local TZ)
+              25-12-2026 18:30           (exact local date + time)
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    now = datetime.utcnow()
+    result = None
+    if re.fullmatch(r"(?:\s*\d+\s*[dhm]\s*)+", t):
+        mins = sum(int(n) * {"d": 1440, "h": 60, "m": 1}[u] for n, u in re.findall(r"(\d+)\s*([dhm])", t))
+        result = now + timedelta(minutes=mins) if mins > 0 else None
+    else:
+        for fmt in ("%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M", "%d-%m-%Y %I:%M %p"):
+            try:
+                result = datetime.strptime(t, fmt) - tz_offset()
+                break
+            except ValueError:
+                continue
+        if result is None:
+            for fmt in ("%H:%M", "%I:%M %p", "%I %p"):
+                try:
+                    hm = datetime.strptime(t, fmt)
+                except ValueError:
+                    continue
+                now_local = now + tz_offset()
+                cand = now_local.replace(hour=hm.hour, minute=hm.minute, second=0, microsecond=0)
+                if cand <= now_local:
+                    cand += timedelta(days=1)
+                result = cand - tz_offset()
+                break
+    if result is None or result <= now:
+        return None
+    return result
 
 
 def _is_real_pic(value) -> bool:
@@ -95,6 +151,135 @@ class FsubManager:
         self.link_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self.chat_cache: dict[int, object] = {}
         self.awaiting_tut: dict[int, float] = {}       # uid -> expiry (tutorial upload)
+        self._maint_task = None
+
+    # ------------------------------------------------------------------
+    # auto remove / request target / link rotation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def limit_progress(doc: dict) -> int:
+        """New requests (request mode) or joins (normal mode) since the target was set."""
+        if doc.get("mode", "off") == "on":
+            return doc.get("request_count", 0) - doc.get("limit_base_req", 0)
+        return doc.get("join_count", 0) - doc.get("limit_base_join", 0)
+
+    async def _notify_owner(self, client: Client, text: str):
+        try:
+            from utils import helpers as _h
+            senders = [getattr(_h, "main_bot_client", None), client]
+        except Exception:
+            senders = [client]
+        for sender in senders:
+            if not sender:
+                continue
+            try:
+                await sender.send_message(self.owner_id, text)
+                return
+            except Exception:
+                continue
+
+    async def remove_channel_now(self, client: Client, cid: int, reason: str) -> bool:
+        """Remove a channel from fsub AND expire its invite link."""
+        doc = await self.db.get_channel_doc(cid)
+        if not doc:
+            return False
+        chat = await self._chat(client, cid)
+        title = getattr(chat, "title", None) or str(cid)
+        await revoke_fsub_link(client, self.db, cid)
+        await self.db.rem_channel(cid)
+        self.chat_cache.pop(cid, None)
+        log.info(f"[fsub] bot {self.bot_id}: channel {cid} auto-removed ({reason})")
+        await self._notify_owner(
+            client,
+            "<b>🗑 Channel auto-removed from Fsub</b>\n\n"
+            f"<blockquote><b>Channel:</b> {title}\n<code>{cid}</code>\n"
+            f"<b>Reason:</b> {reason}\n\n"
+            "🔗 Its invite link has been expired.</blockquote>",
+        )
+        return True
+
+    async def check_limits(self, client: Client, cid: int) -> bool:
+        """Remove the channel if its request/join target is reached. True if removed."""
+        doc = await self.db.get_channel_doc(cid)
+        if not doc:
+            return False
+        limit = doc.get("request_limit") or 0
+        if limit and self.limit_progress(doc) >= limit:
+            kind = "requests" if doc.get("mode", "off") == "on" else "joins"
+            return await self.remove_channel_now(client, cid, f"target of {limit} {kind} reached")
+        return False
+
+    async def rotate_link(self, client: Client, cid: int) -> bool:
+        """Create a fresh invite link, then expire the previous one."""
+        async with self.link_locks[cid]:
+            old = await self.db.get_invite_link(cid)
+            if not old:
+                return False
+            is_request = (await self.db.get_channel_mode(cid)) == "on"
+            inv = None
+            for _ in range(3):
+                try:
+                    inv = await client.create_chat_invite_link(chat_id=cid, creates_join_request=is_request)
+                    break
+                except FloodWait as fw:
+                    await asyncio.sleep(fw.value + 2)
+                except Exception as e:
+                    log.error(f"[fsub] rotate_link({cid}) create failed: {e}")
+                    return False
+            if inv is None:
+                return False
+            await self.db.save_invite_link(cid, inv.invite_link, is_request)
+            try:
+                await client.revoke_chat_invite_link(cid, old["invite_link"])
+            except Exception:
+                pass
+            log.info(f"[fsub] bot {self.bot_id}: rotated invite link of {cid}")
+            return True
+
+    async def maintenance_tick(self, client: Client):
+        now = datetime.utcnow()
+        for doc in await self.db.get_all_channel_docs():
+            cid = doc["_id"]
+            try:
+                remove_at = doc.get("remove_at")
+                if remove_at and now >= remove_at:
+                    await self.remove_channel_now(client, cid, "scheduled removal time reached")
+                    continue
+                limit = doc.get("request_limit") or 0
+                if limit and self.limit_progress(doc) >= limit:
+                    await self.check_limits(client, cid)
+                    continue
+                hours = doc.get("rotate_hours") or 0
+                if hours and doc.get("invite_link"):
+                    marks = [m for m in (doc.get("invite_created_at"), doc.get("rotate_since")) if m]
+                    if marks and now - max(marks) >= timedelta(hours=hours):
+                        await self.rotate_link(client, cid)
+            except Exception as e:
+                log.error(f"[fsub] maintenance error for {cid}: {e}")
+
+    async def _maintenance_loop(self):
+        await asyncio.sleep(20)
+        while True:
+            try:
+                if getattr(self.app, "is_connected", True):
+                    await self.maintenance_tick(self.app)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error(f"[fsub] maintenance loop error: {e}")
+            await asyncio.sleep(60)
+
+    def start_maintenance(self):
+        if self._maint_task is None or self._maint_task.done():
+            self._maint_task = asyncio.create_task(self._maintenance_loop())
+
+    def stop(self):
+        """Called when the worker bot stops."""
+        if self._maint_task and not self._maint_task.done():
+            self._maint_task.cancel()
+        for t in list(self.poll_tasks.values()):
+            t.cancel()
 
     # ------------------------------------------------------------------
     # low level helpers
@@ -606,6 +791,7 @@ class FsubManager:
                     # Record only — never auto-approve (owner approves manually)
                     await mgr.db.req_user(cid, uid)
                     await mgr.db.inc_request_count(cid)
+                    await mgr.check_limits(client, cid)       # target reached -> auto-remove + expire link
                     asyncio.create_task(mgr.notify_event(client, uid))
             except Exception as e:
                 log.error(f"[fsub] join_request handler error: {e}")
@@ -624,6 +810,7 @@ class FsubManager:
                         return
                     asyncio.create_task(mgr.notify_event(client, user.id))
                     await mgr.db.inc_join_count(chat.id)
+                    await mgr.check_limits(client, chat.id)
                     if await mgr.db.req_user_exist(chat.id, user.id):
                         await mgr.db.del_req_user(chat.id, user.id)
                         asyncio.create_task(mgr._approved_dm(client, user.id, chat))
@@ -822,4 +1009,9 @@ def setup_fsub(app: Client, worker_db, bot_id: int, owner_id: int, is_admin) -> 
     """Create the FsubManager for one worker bot and register all its handlers."""
     mgr = FsubManager(app, worker_db, bot_id, owner_id, is_admin)
     mgr.register()
+    app._fsub_mgr = mgr
+    try:
+        mgr.start_maintenance()
+    except RuntimeError:
+        pass  # no running loop (never the case inside the worker engine)
     return mgr
