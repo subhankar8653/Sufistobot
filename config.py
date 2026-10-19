@@ -1,6 +1,7 @@
 #@suhanibots
 
 import os
+import re
 import sys
 import logging
 from logging.handlers import RotatingFileHandler
@@ -20,6 +21,12 @@ TG_BOT_TOKEN = BOT_TOKEN # Alias for backward compatibility
 #@suhanibots
 # Owner's Telegram user ID (numeric)
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+
+# Optional: user IDs that may use the MAIN bot (create / manage bots) besides OWNER_ID.
+# Comma or space separated. The owner can also add/remove people at runtime with /addadmin.
+MAIN_ADMIN_IDS = {
+    int(x) for x in re.split(r"[,\s]+", os.environ.get("MAIN_ADMINS", "")) if x.strip().lstrip("-").isdigit()
+}
 
 # MongoDB connection URI
 MONGO_URI = os.environ.get("MONGO_URI", "")
