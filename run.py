@@ -173,6 +173,13 @@ async def main():
     except Exception:
         pass
 
+    # Backfill: mirror every bot's admins into the registry (owner/admin "My Bots" view)
+    try:
+        from database.main_db import MainDB
+        await MainDB().sync_admin_ids()
+    except Exception as e:
+        log.error(f"admin_ids sync failed: {e}")
+
     # Start all worker bots (independent of main bot)
     from worker_bot.engine import worker_engine
     log.info("Starting worker engine...")
