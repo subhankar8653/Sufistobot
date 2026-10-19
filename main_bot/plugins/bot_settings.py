@@ -246,7 +246,9 @@ async def handle_auto_delete_input(client: Client, message: Message, state: dict
 # FORCE SUBSCRIBE  (Link-sharing-bot style panel)
 # =============================================================================
 
-from worker_bot.fsub_logic import FSUB_DURATION_OPTIONS, revoke_fsub_link
+from worker_bot.fsub_logic import (
+    FSUB_DURATION_OPTIONS, revoke_fsub_link, parse_remove_time, fmt_local, tz_label,
+)
 
 
 async def _worker_client(bot_id: int):
@@ -295,7 +297,10 @@ async def _show_fsub_menu(query: CallbackQuery, bot_id: int):
             mode_text = "📩 Request" if mode == "on" else "🔒 Normal"
             stats = await worker_db.get_fsub_stats(ch_id)
             name = await worker_db.get_channel_name(ch_id)
-            channel_list += f"  {i}. <code>{ch_id}</code> — {mode_text}\n"
+            cdoc = await worker_db.get_channel_doc(ch_id) or {}
+            flags = (" ⏰" if cdoc.get("remove_at") else "") + (" 🎯" if cdoc.get("request_limit") else "") \
+                + (" 🔁" if cdoc.get("rotate_hours") else "")
+            channel_list += f"  {i}. <code>{ch_id}</code> — {mode_text}{flags}\n"
             if name:
                 channel_list += f"      ✏️ {name}\n"
             channel_list += f"      👥 {stats['join_count']} joined | 📥 {stats['request_count']} requests\n"
@@ -322,6 +327,7 @@ async def _show_fsub_menu(query: CallbackQuery, bot_id: int):
                 InlineKeyboardButton("✏️ Rename Button", callback_data=f"fsubren_{bot_id}"),
             ],
             [InlineKeyboardButton("🔄 Mode (Request / Normal)", callback_data=f"toggle_fsub_{bot_id}")],
+            [InlineKeyboardButton("⏳ Auto Remove / Link Rotate", callback_data=f"fsubsch_{bot_id}")],
             [InlineKeyboardButton("⏱ Check Duration", callback_data=f"fsubdur_{bot_id}")],
             [InlineKeyboardButton(
                 f"🤖 Auto Check: {'ON ✅' if auto_on else 'OFF ❌'}",
@@ -374,6 +380,28 @@ async def add_fsub_callback(client: Client, query: CallbackQuery):
     await query.answer()
 
 
+async def _revoke_link_any(bot: dict, worker_db, channel_id: int):
+    """Expire the channel's invite link — via the running worker, or (if the worker is
+    stopped) via a temporary client, so a removed channel's link is ALWAYS dead."""
+    wc = await _worker_client(bot["_id"])
+    if wc:
+        await revoke_fsub_link(wc, worker_db, channel_id)
+        return
+    try:
+        tc = Client(
+            name=f"revoke_{bot['_id']}", api_id=API_ID, api_hash=API_HASH,
+            bot_token=decrypt_token(bot["bot_token_encrypted"]), in_memory=True,
+        )
+        await tc.start()
+        try:
+            await revoke_fsub_link(tc, worker_db, channel_id)
+        finally:
+            await tc.stop()
+    except Exception as e:
+        log.error(f"revoke via temp client failed for {channel_id}: {e}")
+        await worker_db.clear_invite_link(channel_id)
+
+
 # ---- Remove channel --------------------------------------------------------
 
 @Client.on_callback_query(filters.regex(r"^rem_fsub_(\d+)$"))
@@ -415,7 +443,7 @@ async def do_rem_fsub_callback(client: Client, query: CallbackQuery):
         return
 
     worker_db = WorkerDB(bot_id)
-    await revoke_fsub_link(await _worker_client(bot_id), worker_db, channel_id)
+    await _revoke_link_any(bot, worker_db, channel_id)
     await worker_db.rem_channel(channel_id)
 
     await query.answer(f"✅ Channel {channel_id} removed!", show_alert=True)
@@ -728,6 +756,241 @@ async def handle_fsub_rename_input(client: Client, message: Message, state: dict
         else f"<b>✅ Button name set to:</b> {text}",
         reply_markup=back,
     )
+
+
+# ---- Auto remove / request target / link rotation ---------------------------
+
+ROTATE_OPTIONS = [("Off", 0), ("1h", 1), ("3h", 3), ("6h", 6), ("12h", 12), ("24h", 24)]
+
+
+async def _show_channel_sched(query: CallbackQuery, bot_id: int, ch_id: int):
+    worker_db = WorkerDB(bot_id)
+    doc = await worker_db.get_channel_doc(ch_id)
+    if not doc:
+        await query.answer("Channel not found (maybe already removed).", show_alert=True)
+        return
+    title = await _channel_title(bot_id, ch_id)
+    mode = doc.get("mode", "off")
+
+    remove_at = doc.get("remove_at")
+    remove_line = f"{fmt_local(remove_at)} ({tz_label()})" if remove_at else "Not set"
+
+    limit = doc.get("request_limit") or 0
+    if limit:
+        done = max(0, worker_db_progress(doc))
+        kind = "requests" if mode == "on" else "joins"
+        limit_line = f"{done} / {limit} {kind}"
+    else:
+        limit_line = "Not set"
+
+    hours = doc.get("rotate_hours") or 0
+    rot_line = f"Every {hours}h" if hours else "Off"
+
+    rot_row = [
+        InlineKeyboardButton(
+            f"{label}{' ✅' if hours == h else ''}",
+            callback_data=f"fsubrot_{bot_id}_{ch_id}_{h}",
+        )
+        for label, h in ROTATE_OPTIONS
+    ]
+    await _safe_edit(
+        query,
+        f"<b>⏳ Auto Remove & Link Rotation</b>\n\n"
+        f"<blockquote><b>Channel:</b> {title}\n<code>{ch_id}</code> — "
+        f"{'📩 Request' if mode == 'on' else '🔒 Normal'}\n\n"
+        f"⏰ <b>Auto-remove at:</b> {remove_line}\n"
+        f"🎯 <b>Target:</b> {limit_line}\n"
+        f"🔁 <b>Link rotation:</b> {rot_line}</blockquote>\n"
+        f"<i>Whenever a channel leaves fsub — manually or automatically — its invite link is expired.</i>",
+        InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("⏰ Set Remove Time", callback_data=f"fsubrt_{bot_id}_{ch_id}"),
+                InlineKeyboardButton("✖️", callback_data=f"fsubrtx_{bot_id}_{ch_id}"),
+            ],
+            [
+                InlineKeyboardButton("🎯 Set Request Target", callback_data=f"fsublim_{bot_id}_{ch_id}"),
+                InlineKeyboardButton("✖️", callback_data=f"fsublimx_{bot_id}_{ch_id}"),
+            ],
+            [InlineKeyboardButton("🔁 New link every:", callback_data=f"fsubinfo_{bot_id}")],
+            rot_row[:3],
+            rot_row[3:],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"fsubsch_{bot_id}")],
+        ]),
+    )
+
+
+def worker_db_progress(doc: dict) -> int:
+    from worker_bot.fsub_logic import FsubManager
+    return FsubManager.limit_progress(doc)
+
+
+@Client.on_callback_query(filters.regex(r"^fsubsch_(\d+)$"))
+async def fsub_sched_list_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubsch_(\d+)$", query.data)
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+    _get_state().pop(query.from_user.id, None)
+    channels = await WorkerDB(bot_id).show_channels()
+    if not channels:
+        await query.answer("No channels added!", show_alert=True)
+        return
+    titles = await asyncio.gather(*[_channel_title(bot_id, c) for c in channels])
+    buttons = [
+        [InlineKeyboardButton(f"⚙️ {t}"[:60], callback_data=f"fsubschc_{bot_id}_{c}")]
+        for c, t in zip(channels, titles)
+    ]
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")])
+    await _safe_edit(
+        query,
+        "<b>⏳ Auto Remove / Link Rotate</b>\n\n"
+        "<blockquote>Pick a channel. You can:\n"
+        "⏰ remove it from fsub at a set time\n"
+        "🎯 remove it after N requests / joins\n"
+        "🔁 give it a fresh invite link every N hours\n\n"
+        "Every removal expires the channel's invite link.</blockquote>",
+        InlineKeyboardMarkup(buttons),
+    )
+    await query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^fsubschc_(\d+)_(-?\d+)$"))
+async def fsub_sched_channel_callback(client: Client, query: CallbackQuery):
+    m = re.match(r"^fsubschc_(\d+)_(-?\d+)$", query.data)
+    bot_id, ch_id = int(m.group(1)), int(m.group(2))
+    if not await _verify_ownership(query, bot_id):
+        return
+    _get_state().pop(query.from_user.id, None)
+    await _show_channel_sched(query, bot_id, ch_id)
+    await query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^fsubrt_(\d+)_(-?\d+)$"))
+async def fsub_remove_time_callback(client: Client, query: CallbackQuery):
+    m = re.match(r"^fsubrt_(\d+)_(-?\d+)$", query.data)
+    bot_id, ch_id = int(m.group(1)), int(m.group(2))
+    if not await _verify_ownership(query, bot_id):
+        return
+    _get_state()[query.from_user.id] = {
+        "step": "awaiting_fsub_remove_time",
+        "data": {"bot_id": bot_id, "channel_id": ch_id},
+    }
+    await query.message.edit_text(
+        "<b>⏰ When should this channel leave fsub?</b>\n\n"
+        "<blockquote>Send one of:\n"
+        "• <code>6h</code>, <code>1d 12h</code>, <code>90m</code> — from now\n"
+        "• <code>12:00</code> or <code>6:30 pm</code> — next time it is that clock time\n"
+        "• <code>25-12-2026 18:30</code> — exact date and time\n\n"
+        f"Clock times use <b>{tz_label()}</b>.</blockquote>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"fsubschc_{bot_id}_{ch_id}")],
+        ]),
+    )
+    await query.answer()
+
+
+async def handle_fsub_remove_time_input(client: Client, message: Message, state: dict):
+    user_id = message.from_user.id
+    bot_id, ch_id = state["data"]["bot_id"], state["data"]["channel_id"]
+    when = parse_remove_time(message.text or "")
+    if when is None:
+        await message.reply(
+            "<b>❌ Couldn't read that (or it is in the past).</b>\n"
+            "Try <code>6h</code>, <code>12:00</code> or <code>25-12-2026 18:30</code>."
+        )
+        return
+    ok = await WorkerDB(bot_id).set_remove_at(ch_id, when)
+    _get_state().pop(user_id, None)
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"fsubschc_{bot_id}_{ch_id}")]])
+    if not ok:
+        await message.reply("<b>❌ That channel is not in the fsub list.</b>", reply_markup=back)
+        return
+    await message.reply(
+        f"<b>✅ Channel will be removed from fsub at</b>\n"
+        f"<code>{fmt_local(when)}</code> ({tz_label()})\n\n"
+        "<i>Its invite link will be expired at that moment. (Checked every minute while the bot is running.)</i>",
+        reply_markup=back,
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^fsubrtx_(\d+)_(-?\d+)$"))
+async def fsub_remove_time_clear_callback(client: Client, query: CallbackQuery):
+    m = re.match(r"^fsubrtx_(\d+)_(-?\d+)$", query.data)
+    bot_id, ch_id = int(m.group(1)), int(m.group(2))
+    if not await _verify_ownership(query, bot_id):
+        return
+    await WorkerDB(bot_id).set_remove_at(ch_id, None)
+    await query.answer("Remove time cleared")
+    await _show_channel_sched(query, bot_id, ch_id)
+
+
+@Client.on_callback_query(filters.regex(r"^fsublim_(\d+)_(-?\d+)$"))
+async def fsub_limit_callback(client: Client, query: CallbackQuery):
+    m = re.match(r"^fsublim_(\d+)_(-?\d+)$", query.data)
+    bot_id, ch_id = int(m.group(1)), int(m.group(2))
+    if not await _verify_ownership(query, bot_id):
+        return
+    mode = await WorkerDB(bot_id).get_channel_mode(ch_id)
+    _get_state()[query.from_user.id] = {
+        "step": "awaiting_fsub_limit",
+        "data": {"bot_id": bot_id, "channel_id": ch_id},
+    }
+    kind = "join requests" if mode == "on" else "joins"
+    await query.message.edit_text(
+        f"<b>🎯 Request target</b>\n\n"
+        f"<blockquote>Send a number. After that many NEW {kind} from now, the channel is "
+        f"removed from fsub automatically and its invite link is expired.\n\n"
+        f"Example: <code>5000</code></blockquote>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"fsubschc_{bot_id}_{ch_id}")],
+        ]),
+    )
+    await query.answer()
+
+
+async def handle_fsub_limit_input(client: Client, message: Message, state: dict):
+    user_id = message.from_user.id
+    bot_id, ch_id = state["data"]["bot_id"], state["data"]["channel_id"]
+    txt = (message.text or "").strip().replace(",", "")
+    if not txt.isdigit() or int(txt) <= 0:
+        await message.reply("<b>❌ Send a positive number, e.g. <code>5000</code>.</b>")
+        return
+    ok = await WorkerDB(bot_id).set_request_limit(ch_id, int(txt))
+    _get_state().pop(user_id, None)
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"fsubschc_{bot_id}_{ch_id}")]])
+    if not ok:
+        await message.reply("<b>❌ That channel is not in the fsub list.</b>", reply_markup=back)
+        return
+    await message.reply(
+        f"<b>✅ Target set: {int(txt)}</b>\n\n"
+        "<i>Counting starts now. When it is reached the channel leaves fsub and its link expires.</i>",
+        reply_markup=back,
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^fsublimx_(\d+)_(-?\d+)$"))
+async def fsub_limit_clear_callback(client: Client, query: CallbackQuery):
+    m = re.match(r"^fsublimx_(\d+)_(-?\d+)$", query.data)
+    bot_id, ch_id = int(m.group(1)), int(m.group(2))
+    if not await _verify_ownership(query, bot_id):
+        return
+    await WorkerDB(bot_id).set_request_limit(ch_id, 0)
+    await query.answer("Target cleared")
+    await _show_channel_sched(query, bot_id, ch_id)
+
+
+@Client.on_callback_query(filters.regex(r"^fsubrot_(\d+)_(-?\d+)_(\d+)$"))
+async def fsub_rotate_callback(client: Client, query: CallbackQuery):
+    m = re.match(r"^fsubrot_(\d+)_(-?\d+)_(\d+)$", query.data)
+    bot_id, ch_id, hours = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not await _verify_ownership(query, bot_id):
+        return
+    if hours not in [h for _, h in ROTATE_OPTIONS]:
+        await query.answer("Invalid option.", show_alert=True)
+        return
+    await WorkerDB(bot_id).set_link_rotation(ch_id, hours)
+    await query.answer("🔁 Link rotation " + (f"every {hours}h" if hours else "off"))
+    await _show_channel_sched(query, bot_id, ch_id)
 
 
 # ---- Channel ID input (add) -------------------------------------------------
