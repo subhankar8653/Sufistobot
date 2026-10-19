@@ -27,14 +27,15 @@ async def my_bots_callback(client: Client, query: CallbackQuery):
     from main_bot.plugins.create_bot import _creation_state
     _creation_state.pop(user_id, None)
 
-    bots = await main_db.get_user_bots(user_id)
+    all_bots = await main_db.get_all_bots()
+    is_super = main_db.is_super(user_id)
 
-    if not bots:
+    if not all_bots:
         await query.message.edit_text(
             "<b>━━━━━━━━━━━━━━━━━━━━━\n"
             "📋 𝗠𝗬 𝗕𝗢𝗧𝗦\n"
             "━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-            "<blockquote>ʏᴏᴜ ʜᴀᴠᴇɴ'ᴛ ᴄʀᴇᴀᴛᴇᴅ ᴀɴʏ ʙᴏᴛs ʏᴇᴛ.\n"
+            "<blockquote>ɴᴏ ʙᴏᴛs ʏᴇᴛ.\n"
             "ᴛᴀᴘ <b>⚡ ᴄʀᴇᴀᴛᴇ ʙᴏᴛ</b> ᴛᴏ ɢᴇᴛ sᴛᴀʀᴛᴇᴅ!</blockquote>",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚡ ᴄʀᴇᴀᴛᴇ ʙᴏᴛ", callback_data="create_bot")],
@@ -44,34 +45,64 @@ async def my_bots_callback(client: Client, query: CallbackQuery):
         await query.answer()
         return
 
-    # Build buttons for each bot
+    # Build buttons: every bot of the system is listed (global slots).
+    # Bots the user may not manage show as locked and cannot be opened.
     from worker_bot.engine import worker_engine
     buttons = []
-    for bot in bots:
+    for idx, bot in enumerate(all_bots, start=1):
         bot_id = bot["_id"]
-        is_live = worker_engine.get_worker(bot_id) is not None
-        status = "🟢" if is_live else "🔴"
-        username = bot.get("bot_username", "unknown")
-        bot_id = bot["_id"]
-        role = "👑" if bot.get("owner_id") == user_id else "🛡"
-        buttons.append([
-            InlineKeyboardButton(
-                f"{status} {role} @{username}",
-                callback_data=f"dashboard_{bot_id}",
-            )
-        ])
+        if await main_db.can_manage(bot, user_id):
+            is_live = worker_engine.get_worker(bot_id) is not None
+            status = "🟢" if is_live else "🔴"
+            username = bot.get("bot_username", "unknown")
+            if bot.get("owner_id") == user_id:
+                role = "👑"
+            else:
+                role = "🛡"
+            label = f"{status} {role} @{username}"
+            if is_super and bot.get("owner_id") != user_id:
+                label += f"  ·  {bot.get('owner_id')}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"dashboard_{bot_id}")])
+        else:
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🔒 ʙᴏᴛ {idx:02d} — sʟᴏᴛ ꜰᴜʟʟ",
+                    callback_data=f"locked_bot_{idx}",
+                )
+            ])
 
+    if len(all_bots) < MAX_BOTS_PER_USER:
+        buttons.append([InlineKeyboardButton("⚡ ᴄʀᴇᴀᴛᴇ ʙᴏᴛ", callback_data="create_bot")])
     buttons.append([InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ ᴍᴇɴᴜ", callback_data="back_menu")])
+
+    legend = (
+        "👑 = ʏᴏᴜʀ ʙᴏᴛ   🛡 = ᴀᴅᴍɪɴ / ᴛᴇᴀᴍ ʙᴏᴛ"
+        if not is_super
+        else "👑 = ʏᴏᴜʀ ʙᴏᴛ   🛡 = ᴀᴅᴍɪɴ ʙᴏᴛ (ɪᴅ = ᴄʀᴇᴀᴛᴏʀ)"
+    )
+    if not is_super:
+        legend += "\n🔒 = ᴀɴᴏᴛʜᴇʀ ᴀᴅᴍɪɴ's ʙᴏᴛ (sʟᴏᴛ ꜰᴜʟʟ)"
 
     await query.message.edit_text(
         f"<b>━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 𝗠𝗬 𝗕𝗢𝗧𝗦  [{len(bots)}/{MAX_BOTS_PER_USER}]\n"
+        f"📋 𝗠𝗬 𝗕𝗢𝗧𝗦  [{len(all_bots)}/{MAX_BOTS_PER_USER}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
         f"<blockquote>sᴇʟᴇᴄᴛ ᴀ ʙᴏᴛ ᴛᴏ ᴏᴘᴇɴ ɪᴛs ᴅᴀsʜʙᴏᴀʀᴅ.\n"
-        f"👑 = ʏᴏᴜʀ ʙᴏᴛ   🛡 = ᴛᴇᴀᴍ / ᴀᴅᴍɪɴ ʙᴏᴛ</blockquote>",
+        f"{legend}</blockquote>",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     await query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^locked_bot_(\d+)$"))
+async def locked_bot_callback(client: Client, query: CallbackQuery):
+    """Someone else's bot slot: visible but not openable."""
+    idx = int(query.data.rsplit("_", 1)[1])
+    await query.answer(
+        f"🔒 ʙᴏᴛ {idx:02d} ꜱʟᴏᴛ ɪꜱ ꜰᴜʟʟ — ɪᴛ ʙᴇʟᴏɴɢꜱ ᴛᴏ ᴀɴᴏᴛʜᴇʀ ᴀᴅᴍɪɴ.\n"
+        "You can only open your own bots.",
+        show_alert=True,
+    )
 
 
 # =============================================================================
@@ -346,7 +377,7 @@ async def confirm_delete_callback(client: Client, query: CallbackQuery):
     bot_id = int(match.group(1))
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or bot["owner_id"] != query.from_user.id:
+    if not bot or not main_db.is_owner(bot, query.from_user.id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 
@@ -381,7 +412,7 @@ async def delete_bot_callback(client: Client, query: CallbackQuery):
     bot_id = int(match.group(1))
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or bot["owner_id"] != query.from_user.id:
+    if not bot or not main_db.is_owner(bot, query.from_user.id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 

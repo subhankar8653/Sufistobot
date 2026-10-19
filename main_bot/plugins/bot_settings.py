@@ -1479,8 +1479,8 @@ async def handle_admin_input(client: Client, message: Message, state: dict):
 
     await message.reply(
         f"<b>✅ Admin <code>{admin_id}</code> added!</b>\n\n"
-        f"<blockquote>You are now one team: both of you see and control ALL each other's bots "
-        f"from <b>My Bots</b>. The {MAX_BOTS_PER_USER}-bot limit is shared by the whole team.</blockquote>",
+        f"<blockquote>This admin can now open and manage this bot from <b>My Bots</b>. "
+        f"The {MAX_BOTS_PER_USER}-bot limit is global (all admins combined).</blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Back", callback_data=f"admins_{bot_id}")],
         ]),

@@ -36,8 +36,8 @@ async def create_bot_callback(client: Client, query: CallbackQuery):
     bot_count = await main_db.count_user_bots(user_id)
     if bot_count >= MAX_BOTS_PER_USER:
         await query.answer(
-            f"❌ Limit reached: {MAX_BOTS_PER_USER} bots in total "
-            f"(your bots + bots of your admins / owner team).",
+            f"❌ Limit reached: only {MAX_BOTS_PER_USER} bots allowed in total "
+            f"(all admins combined). All slots are full.",
             show_alert=True,
         )
         return
@@ -251,6 +251,17 @@ async def handle_creation_input(client: Client, message: Message):
                 f"<blockquote>Error: <code>{str(e)[:150]}</code></blockquote>",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("❌ Cancel", callback_data="cancel_creation")],
+                ]),
+            )
+            return
+
+        # Re-check the GLOBAL limit right before saving (race / long flow)
+        if await main_db.count_user_bots(user_id) >= MAX_BOTS_PER_USER:
+            _creation_state.pop(user_id, None)
+            await status_msg.edit_text(
+                f"<b>❌ Limit reached: only {MAX_BOTS_PER_USER} bots allowed in total.</b>",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_menu")],
                 ]),
             )
             return
