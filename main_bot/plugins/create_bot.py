@@ -36,7 +36,8 @@ async def create_bot_callback(client: Client, query: CallbackQuery):
     bot_count = await main_db.count_user_bots(user_id)
     if bot_count >= MAX_BOTS_PER_USER:
         await query.answer(
-            f"❌ You've reached the limit of {MAX_BOTS_PER_USER} bots!",
+            f"❌ Limit reached: {MAX_BOTS_PER_USER} bots in total "
+            f"(bots you own + bots you are admin of).",
             show_alert=True,
         )
         return

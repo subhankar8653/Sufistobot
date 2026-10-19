@@ -7,7 +7,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
 )
 #@suhanibots
-from config import LOGGER, BACKEND_API_SECRET, BACKEND_API_URL
+from config import LOGGER, BACKEND_API_SECRET, BACKEND_API_URL, MAX_BOTS_PER_USER
 from database.main_db import MainDB
 from utils.security import mask_token, decrypt_token
 
@@ -21,7 +21,7 @@ main_db = MainDB()
 #@suhanibots
 @Client.on_callback_query(filters.regex(r"^my_bots$"))
 async def my_bots_callback(client: Client, query: CallbackQuery):
-    """List all bots owned by the user."""
+    """List ALL bots the user owns or administers, in one place."""
     user_id = query.from_user.id
 
     from main_bot.plugins.create_bot import _creation_state
@@ -53,9 +53,10 @@ async def my_bots_callback(client: Client, query: CallbackQuery):
         status = "🟢" if is_live else "🔴"
         username = bot.get("bot_username", "unknown")
         bot_id = bot["_id"]
+        role = "👑" if bot.get("owner_id") == user_id else "🛡"
         buttons.append([
             InlineKeyboardButton(
-                f"{status} @{username}",
+                f"{status} {role} @{username}",
                 callback_data=f"dashboard_{bot_id}",
             )
         ])
@@ -64,9 +65,10 @@ async def my_bots_callback(client: Client, query: CallbackQuery):
 
     await query.message.edit_text(
         f"<b>━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 𝗠𝗬 𝗕𝗢𝗧𝗦  [{len(bots)}/5]\n"
+        f"📋 𝗠𝗬 𝗕𝗢𝗧𝗦  [{len(bots)}/{MAX_BOTS_PER_USER}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
-        f"<blockquote>sᴇʟᴇᴄᴛ ᴀ ʙᴏᴛ ᴛᴏ ᴏᴘᴇɴ ɪᴛs ᴅᴀsʜʙᴏᴀʀᴅ:</blockquote>",
+        f"<blockquote>sᴇʟᴇᴄᴛ ᴀ ʙᴏᴛ ᴛᴏ ᴏᴘᴇɴ ɪᴛs ᴅᴀsʜʙᴏᴀʀᴅ.\n"
+        f"👑 = ᴏᴡɴᴇʀ   🛡 = ᴀᴅᴍɪɴ</blockquote>",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     await query.answer()
@@ -93,7 +95,7 @@ async def dashboard_callback(client: Client, query: CallbackQuery):
 
     # Verify ownership
     bot = await main_db.get_bot(bot_id)
-    if not bot or bot["owner_id"] != user_id:
+    if not bot or not main_db.can_manage(bot, user_id):
         await query.answer("❌ Bot not found or access denied!", show_alert=True)
         return
 
@@ -127,7 +129,14 @@ async def dashboard_callback(client: Client, query: CallbackQuery):
         f"</blockquote>"
     )
 
-    keyboard = InlineKeyboardMarkup([
+    is_owner = main_db.is_owner(bot, user_id)
+    if not is_owner:
+        text += (
+            f"\n<blockquote>🛡 ʏᴏᴜ ᴀʀᴇ ᴀɴ <b>ᴀᴅᴍɪɴ</b> ᴏꜰ ᴛʜɪs ʙᴏᴛ\n"
+            f"👑 ᴏᴡɴᴇʀ: <code>{bot.get('owner_id')}</code></blockquote>"
+        )
+
+    rows = [
         [
             InlineKeyboardButton("📢 ʟᴏɢ ᴄʜᴀɴɴᴇʟ", callback_data=f"set_channel_{bot_id}"),
             InlineKeyboardButton("⏱ ᴀᴜᴛᴏ-ᴅᴇʟ", callback_data=f"auto_delete_{bot_id}"),
@@ -140,7 +149,6 @@ async def dashboard_callback(client: Client, query: CallbackQuery):
             InlineKeyboardButton("🔗 sʜᴏʀᴛᴇɴᴇʀ", callback_data=f"shortener_{bot_id}"),
         ],
         [
-            InlineKeyboardButton("👥 ᴀᴅᴍɪɴs", callback_data=f"admins_{bot_id}"),
             InlineKeyboardButton("📩 sᴛᴀʀᴛ ᴄꜰɢ", callback_data=f"startcfg_{bot_id}"),
         ],
         [
@@ -149,10 +157,6 @@ async def dashboard_callback(client: Client, query: CallbackQuery):
         ],
         [
             InlineKeyboardButton("🛡️ ᴘʀᴏᴛᴇᴄᴛɪᴏɴ", callback_data=f"toggle_protect_{bot_id}"),
-            InlineKeyboardButton("📦 ᴛʀᴀɴsꜰᴇʀ", callback_data=f"transfer_{bot_id}"),
-        ],
-        [
-            InlineKeyboardButton("🗑 ᴅᴇʟᴇᴛᴇ", callback_data=f"confirm_delete_{bot_id}"),
         ],
         [
             InlineKeyboardButton(
@@ -160,8 +164,16 @@ async def dashboard_callback(client: Client, query: CallbackQuery):
                 callback_data=f"toggle_bot_{bot_id}",
             ),
         ],
-        [InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ ᴍʏ ʙᴏᴛs", callback_data="my_bots")],
-    ])
+    ]
+    if is_owner:
+        # owner-only actions: admin management, data transfer, delete
+        rows.insert(4, [InlineKeyboardButton("👥 ᴀᴅᴍɪɴs", callback_data=f"admins_{bot_id}")])
+        rows.append([
+            InlineKeyboardButton("📦 ᴛʀᴀɴsꜰᴇʀ", callback_data=f"transfer_{bot_id}"),
+            InlineKeyboardButton("🗑 ᴅᴇʟᴇᴛᴇ", callback_data=f"confirm_delete_{bot_id}"),
+        ])
+    rows.append([InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ ᴍʏ ʙᴏᴛs", callback_data="my_bots")])
+    keyboard = InlineKeyboardMarkup(rows)
 
     from pyrogram.errors import MessageNotModified
     try:
@@ -188,7 +200,7 @@ async def toggle_bot_callback(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or bot["owner_id"] != user_id:
+    if not bot or not main_db.can_manage(bot, user_id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 
@@ -237,7 +249,7 @@ async def toggle_protect_callback(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or bot["owner_id"] != user_id:
+    if not bot or not main_db.can_manage(bot, user_id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 
@@ -271,7 +283,7 @@ async def toggle_permanent_link_callback(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or bot["owner_id"] != user_id:
+    if not bot or not main_db.can_manage(bot, user_id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 
@@ -512,6 +524,16 @@ async def do_transfer_callback(client: Client, query: CallbackQuery):
     stats_text = "\n".join(stats_lines) if stats_lines else "ɴᴏ ᴅᴀᴛᴀ ꜰᴏᴜɴᴅ"
 
     src_username = source_bot.get("bot_username", "unknown")
+
+    # Links made for the old bot's log channel(s) must keep working on the new bot
+    try:
+        await main_db.add_old_log_channels(
+            target_bot_id,
+            [source_bot.get("log_channel_id")] + list(source_bot.get("previous_log_channels", [])),
+        )
+        await main_db.sync_bot_admins(target_bot_id)
+    except Exception as e:
+        log.error(f"post-transfer sync failed: {e}")
 
     # Now purge old bot's data and registry permanently
     old_db = WorkerDB(source_bot_id)

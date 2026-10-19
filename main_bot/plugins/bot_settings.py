@@ -10,7 +10,7 @@ from pyrogram.types import (
     InlineKeyboardButton,
 )
 #@suhanibots
-from config import API_ID, API_HASH, LOGGER
+from config import API_ID, API_HASH, LOGGER, MAX_BOTS_PER_USER
 from database.main_db import MainDB
 from database.worker_db import WorkerDB
 from utils.helpers import upload_to_telegraph
@@ -30,10 +30,15 @@ def _get_state():
 # HELPER: Verify bot ownership
 # =============================================================================
 
-async def _verify_ownership(query: CallbackQuery, bot_id: int):
-    """Verify that the user owns the given bot. Returns bot doc or None."""
+async def _verify_ownership(query: CallbackQuery, bot_id: int, owner_only: bool = False):
+    """Verify that the user may manage the given bot (owner OR admin).
+    owner_only=True restricts the action to the bot's owner. Returns bot doc or None."""
     bot = await main_db.get_bot(bot_id)
-    if not bot or bot["owner_id"] != query.from_user.id:
+    uid = query.from_user.id
+    allowed = bool(bot) and (
+        main_db.is_owner(bot, uid) if owner_only else main_db.can_manage(bot, uid)
+    )
+    if not allowed:
         await query.answer("❌ Access denied!", show_alert=True)
         return None
     return bot
@@ -979,7 +984,7 @@ async def handle_shortener_input(client: Client, message: Message, state: dict, 
 async def admins_callback(client: Client, query: CallbackQuery):
     """Show admin management for a bot."""
     bot_id = _extract_bot_id(r"^admins_(\d+)$", query.data)
-    bot = await _verify_ownership(query, bot_id)
+    bot = await _verify_ownership(query, bot_id, owner_only=True)
     if not bot:
         return
 
@@ -1010,7 +1015,7 @@ async def admins_callback(client: Client, query: CallbackQuery):
 async def add_admin_callback(client: Client, query: CallbackQuery):
     """Prompt to add an admin."""
     bot_id = _extract_bot_id(r"^add_admin_(\d+)$", query.data)
-    bot = await _verify_ownership(query, bot_id)
+    bot = await _verify_ownership(query, bot_id, owner_only=True)
     if not bot:
         return
 
@@ -1035,7 +1040,7 @@ async def add_admin_callback(client: Client, query: CallbackQuery):
 async def rem_admin_callback(client: Client, query: CallbackQuery):
     """Show admins to remove."""
     bot_id = _extract_bot_id(r"^rem_admin_(\d+)$", query.data)
-    bot = await _verify_ownership(query, bot_id)
+    bot = await _verify_ownership(query, bot_id, owner_only=True)
     if not bot:
         return
 
@@ -1070,12 +1075,13 @@ async def do_rem_admin_callback(client: Client, query: CallbackQuery):
     match = re.match(r"^do_rem_admin_(\d+)_(\d+)$", query.data)
     bot_id, admin_id = int(match.group(1)), int(match.group(2))
 
-    bot = await _verify_ownership(query, bot_id)
+    bot = await _verify_ownership(query, bot_id, owner_only=True)
     if not bot:
         return
 
     worker_db = WorkerDB(bot_id)
     await worker_db.del_admin(admin_id)
+    await main_db.remove_bot_admin(bot_id, admin_id)
 
     await query.answer(f"✅ Admin {admin_id} removed!", show_alert=True)
     await admins_callback(client, query)
@@ -1092,14 +1098,27 @@ async def handle_admin_input(client: Client, message: Message, state: dict):
         await message.reply("<b>❌ Invalid user ID. Send a number.</b>")
         return
 
+    bot_doc = await main_db.get_bot(bot_id)
+    if not main_db.is_owner(bot_doc, user_id):
+        _get_state().pop(user_id, None)
+        await message.reply("<b>❌ Only the bot owner can add admins.</b>")
+        return
+    if admin_id == bot_doc["owner_id"]:
+        _get_state().pop(user_id, None)
+        await message.reply("<b>ℹ️ The owner already has full access.</b>")
+        return
+
     worker_db = WorkerDB(bot_id)
     await worker_db.add_admin(admin_id)
+    await main_db.add_bot_admin(bot_id, admin_id)   # makes this bot show up in the admin's "My Bots"
 
     creation_state = _get_state()
     creation_state.pop(user_id, None)
 
     await message.reply(
-        f"<b>✅ Admin <code>{admin_id}</code> added!</b>",
+        f"<b>✅ Admin <code>{admin_id}</code> added!</b>\n\n"
+        f"<blockquote>They can now see and manage this bot from <b>My Bots</b>. "
+        f"It also counts toward their {MAX_BOTS_PER_USER}-bot limit.</blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Back", callback_data=f"admins_{bot_id}")],
         ]),
