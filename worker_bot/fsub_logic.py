@@ -38,6 +38,7 @@ from pyrogram.types import (
 import config as _cfg
 from config import LOGGER, OWNER_ID
 from database.main_db import MainDB
+from worker_bot.scale import SingleFlightCache
 
 log = LOGGER(__name__)
 main_db = MainDB()
@@ -49,10 +50,16 @@ _JOINED = {
 }
 
 # Smart auto-check timings
-AUTO_CHECK_FAST_INTERVAL = 2      # first 30s: check every 2s (join/request detected instantly)
+AUTO_CHECK_FAST_INTERVAL = 3      # first 30s: safety-net check every 3s
 AUTO_CHECK_FAST_WINDOW = 30
-AUTO_CHECK_POLL_INTERVAL = 5      # afterwards: every 5s
+AUTO_CHECK_POLL_INTERVAL = 8      # afterwards: every 8s (then 24s after 3 minutes)
 AUTO_CHECK_MAX_DURATION = 900     # stop polling after 15 minutes
+
+DOCS_TTL = 5                      # seconds: channel list / settings are cached this long
+JOINED_TTL = 30                   # seconds: a confirmed "joined" is remembered this long
+LINK_TTL = 300                    # seconds: cached invite link
+API_CONCURRENCY = 25              # max simultaneous Telegram membership calls per bot
+_MANAGERS: dict = {}              # bot_id -> FsubManager (lets revoke_fsub_link clear caches)
 
 TUTORIAL_WAIT = 30                # seconds before tutorial video is sent
 TUTORIAL_DELETE_AFTER = 600       # tutorial video auto-delete (seconds)
@@ -127,6 +134,9 @@ async def revoke_fsub_link(client: Client, worker_db, channel_id: int):
     """Call when a channel is removed from fsub: revoke the permanent invite link
     on Telegram and clear it from the DB. Never raises."""
     try:
+        mgr = _MANAGERS.get(getattr(worker_db, "bot_id", None))
+        if mgr:
+            mgr.forget_channel(channel_id)
         cached = await worker_db.get_invite_link(channel_id)
         if cached and cached.get("invite_link") and client is not None:
             try:
@@ -152,6 +162,11 @@ class FsubManager:
         self.chat_cache: dict[int, object] = {}
         self.awaiting_tut: dict[int, float] = {}       # uid -> expiry (tutorial upload)
         self._maint_task = None
+        self._sf = SingleFlightCache(ttl=DOCS_TTL)           # settings / channel docs cache
+        self._joined: dict = {}                              # (cid, uid) -> monotonic time of confirmed join
+        self._link_cache: dict = {}                          # cid -> (link, is_request, monotonic time)
+        self._api_sem = asyncio.Semaphore(API_CONCURRENCY)
+        _MANAGERS[bot_id] = self
 
     # ------------------------------------------------------------------
     # auto remove / request target / link rotation
@@ -189,6 +204,7 @@ class FsubManager:
         await revoke_fsub_link(client, self.db, cid)
         await self.db.rem_channel(cid)
         self.chat_cache.pop(cid, None)
+        self.forget_channel(cid)
         log.info(f"[fsub] bot {self.bot_id}: channel {cid} auto-removed ({reason})")
         await self._notify_owner(
             client,
@@ -230,6 +246,7 @@ class FsubManager:
             if inv is None:
                 return False
             await self.db.save_invite_link(cid, inv.invite_link, is_request)
+            self._link_cache[cid] = (inv.invite_link, is_request, time.monotonic())
             try:
                 await client.revoke_chat_invite_link(cid, old["invite_link"])
             except Exception:
@@ -276,10 +293,54 @@ class FsubManager:
 
     def stop(self):
         """Called when the worker bot stops."""
+        _MANAGERS.pop(self.bot_id, None)
         if self._maint_task and not self._maint_task.done():
             self._maint_task.cancel()
         for t in list(self.poll_tasks.values()):
             t.cancel()
+
+    # ------------------------------------------------------------------
+    # cached settings (one DB read per DOCS_TTL for ALL users, not one per user)
+    # ------------------------------------------------------------------
+
+    async def _docs(self) -> dict:
+        async def load():
+            docs = await self.db.get_all_channel_docs()
+            return {d["_id"]: d for d in docs}
+        return await self._sf.get("docs", load, ttl=DOCS_TTL)
+
+    async def _channel_ids(self) -> list:
+        return list((await self._docs()).keys())
+
+    async def _mode(self, cid: int) -> str:
+        d = (await self._docs()).get(cid)
+        return d.get("mode", "off") if d else "off"
+
+    async def _name(self, cid: int):
+        d = (await self._docs()).get(cid)
+        return d.get("custom_name") if d else None
+
+    async def _fake_links(self) -> list:
+        return await self._sf.get("fake", self.db.get_fake_links, ttl=DOCS_TTL)
+
+    async def _auto_check(self) -> bool:
+        return await self._sf.get("auto", self.db.get_auto_check, ttl=DOCS_TTL)
+
+    async def _duration_cfg(self) -> dict:
+        return await self._sf.get("dur", self.db.get_fsub_check_duration, ttl=DOCS_TTL)
+
+    async def _tutorial(self):
+        return await self._sf.get("tut", lambda: self.db.get_tutorial("fsub"), ttl=DOCS_TTL)
+
+    def invalidate(self):
+        """Drop cached settings (used after changes made by this manager itself)."""
+        self._sf.clear()
+
+    def forget_channel(self, cid: int):
+        self._link_cache.pop(cid, None)
+        for key in [k for k in self._joined if k[0] == cid]:
+            self._joined.pop(key, None)
+        self.invalidate()
 
     # ------------------------------------------------------------------
     # low level helpers
@@ -293,27 +354,35 @@ class FsubManager:
             return {}
 
     async def _get_member(self, client: Client, cid: int, uid: int):
-        for attempt in range(3):
-            try:
-                return await client.get_chat_member(cid, uid)
-            except FloodWait as fw:
-                await asyncio.sleep(fw.value + 1)
-        return await client.get_chat_member(cid, uid)
-
-    async def _chat(self, client: Client, cid: int):
-        if cid in self.chat_cache:
-            return self.chat_cache[cid]
-        try:
+        async with self._api_sem:          # never more than API_CONCURRENCY calls in flight
             for attempt in range(3):
                 try:
-                    chat = await client.get_chat(cid)
-                    self.chat_cache[cid] = chat
-                    return chat
+                    return await client.get_chat_member(cid, uid)
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 1)
+            return await client.get_chat_member(cid, uid)
+
+    async def _chat(self, client: Client, cid: int):
+        """Chat object of a channel; shared by all concurrent users (one real call)."""
+        if cid in self.chat_cache:
+            return self.chat_cache[cid]
+
+        async def load():
+            async with self._api_sem:
+                for attempt in range(3):
+                    try:
+                        chat = await client.get_chat(cid)
+                        self.chat_cache[cid] = chat
+                        return chat
+                    except FloodWait as fw:
+                        await asyncio.sleep(fw.value + 1)
+            return None
+
+        try:
+            return await self._sf.get(f"chat:{cid}", load, ttl=300, cache_if=lambda v: v is not None)
         except Exception as e:
             log.warning(f"[fsub] get_chat failed for {cid}: {e}")
-        return None
+            return None
 
     def _bypass(self, uid: int) -> bool:
         return uid == self.owner_id or uid == OWNER_ID
@@ -324,7 +393,25 @@ class FsubManager:
 
     async def channel_joined(self, client: Client, uid: int, cid: int) -> bool:
         """True if user is a member of the channel, or (request mode) has a
-        pending join request for it."""
+        pending join request for it. A confirmed join is remembered for JOINED_TTL
+        seconds so the same user is never re-checked in a burst."""
+        stamp = self._joined.get((cid, uid))
+        if stamp is not None and time.monotonic() - stamp < JOINED_TTL:
+            return True
+        ok = await self._channel_joined_live(client, uid, cid)
+        if ok:
+            if len(self._joined) > 20000:
+                self._joined.clear()
+            self._joined[(cid, uid)] = time.monotonic()
+        else:
+            self._joined.pop((cid, uid), None)
+        return ok
+
+    async def _channel_joined_live(self, client: Client, uid: int, cid: int) -> bool:
+        # Request mode: a stored join request already proves the step is done —
+        # answer from the local DB, no Telegram call needed.
+        if await self._mode(cid) == "on" and await self.db.req_user_exist(cid, uid):
+            return True
         try:
             m = await self._get_member(client, cid, uid)
             if m.status in _JOINED:
@@ -337,21 +424,22 @@ class FsubManager:
             # left / banned / restricted -> treat like "not participant"
             raise UserNotParticipant()
         except UserNotParticipant:
-            if await self.db.get_channel_mode(cid) == "on":
+            if await self._mode(cid) == "on":
                 return await self.db.req_user_exist(cid, uid)
             return False
         except Exception as e:
             log.error(f"[fsub] channel_joined error ({cid}): {e}")
             return False
 
-    async def is_subscribed(self, client: Client, uid: int) -> bool:
-        channels = await self.db.show_channels()
+    async def check(self, client: Client, uid: int):
+        """Returns (ok, statuses). statuses = {channel_id: joined?} (empty if skipped)."""
+        channels = await self._channel_ids()
         if not channels or self._bypass(uid):
-            return True
+            return True, {}
 
         # Check-duration (cooldown)
         try:
-            cfg = await self.db.get_fsub_check_duration()
+            cfg = await self._duration_cfg()
         except Exception:
             cfg = {"enabled": False, "hours": 0}
         duration_on = bool(cfg.get("enabled")) and cfg.get("hours", 0) > 0
@@ -361,28 +449,26 @@ class FsubManager:
             except Exception:
                 verified_at = None
             if verified_at and (datetime.utcnow() - verified_at) < timedelta(hours=cfg["hours"]):
-                return True
+                return True, {}
 
         # Parallel check of all channels
         results = await asyncio.gather(
             *[self.channel_joined(client, uid, cid) for cid in channels],
             return_exceptions=True,
         )
-        for cid, res in zip(channels, results):
-            ok = res if isinstance(res, bool) else False
-            if not ok:
-                if await self.db.get_channel_mode(cid) == "on":
-                    # request mode: one more quick check (request may have just landed)
-                    if await self.channel_joined(client, uid, cid):
-                        continue
-                return False
+        statuses = {cid: (res if isinstance(res, bool) else False) for cid, res in zip(channels, results)}
 
-        if duration_on:
-            try:
-                await self.db.set_fsub_verified(uid)
-            except Exception as e:
-                log.error(f"[fsub] set_fsub_verified error: {e}")
-        return True
+        if all(statuses.values()):
+            if duration_on:
+                try:
+                    await self.db.set_fsub_verified(uid)
+                except Exception as e:
+                    log.error(f"[fsub] set_fsub_verified error: {e}")
+            return True, statuses
+        return False, statuses
+
+    async def is_subscribed(self, client: Client, uid: int) -> bool:
+        return (await self.check(client, uid))[0]
 
     # ------------------------------------------------------------------
     # permanent invite link
@@ -390,11 +476,18 @@ class FsubManager:
 
     async def permanent_link(self, client: Client, cid: int, is_request: bool):
         """ONE permanent link per channel (no expiry, no rotation). Re-created only
-        when the mode (join <-> request) changes."""
+        when the mode (join <-> request) changes. Served from memory when possible."""
+        hit = self._link_cache.get(cid)
+        if hit and hit[1] == is_request and time.monotonic() - hit[2] < LINK_TTL:
+            return hit[0]
         async with self.link_locks[cid]:
+            hit = self._link_cache.get(cid)          # another user may have filled it meanwhile
+            if hit and hit[1] == is_request and time.monotonic() - hit[2] < LINK_TTL:
+                return hit[0]
             old = await self.db.get_invite_link(cid)
             if old and old.get("invite_link"):
                 if old.get("is_request") == is_request:
+                    self._link_cache[cid] = (old["invite_link"], is_request, time.monotonic())
                     return old["invite_link"]
                 try:
                     await client.revoke_chat_invite_link(cid, old["invite_link"])
@@ -402,10 +495,12 @@ class FsubManager:
                     pass
             for attempt in range(3):
                 try:
-                    inv = await client.create_chat_invite_link(
-                        chat_id=cid, creates_join_request=is_request
-                    )  # no expire_date on purpose -> permanent
+                    async with self._api_sem:
+                        inv = await client.create_chat_invite_link(
+                            chat_id=cid, creates_join_request=is_request
+                        )  # no expire_date on purpose -> permanent
                     await self.db.save_invite_link(cid, inv.invite_link, is_request)
+                    self._link_cache[cid] = (inv.invite_link, is_request, time.monotonic())
                     return inv.invite_link
                 except FloodWait as fw:
                     await asyncio.sleep(fw.value + 2)
@@ -427,11 +522,11 @@ class FsubManager:
 
     async def _channel_button(self, client: Client, cid: int, position: int, stepwise: bool = False):
         try:
-            mode = await self.db.get_channel_mode(cid)
+            mode = await self._mode(cid)
             link = await self._channel_link(client, cid, mode)
             if not link:
                 return None
-            custom = await self.db.get_channel_name(cid)
+            custom = await self._name(cid)
             label = "Request" if mode == "on" else "Join"
             if stepwise:
                 text = f"🔴 {custom}" if custom else f"🔴 {label} channel {position:02d}"
@@ -442,28 +537,33 @@ class FsubManager:
             log.error(f"[fsub] button error {cid}: {e}")
             return None
 
-    async def _build_all_buttons(self, client: Client, uid: int, start_param):
+    async def _build_all_buttons(self, client: Client, uid: int, start_param, statuses: dict = None):
         """Normal (all-at-once) fsub screen: fake links + every pending channel + Joined."""
         buttons = []
-        channels = await self.db.show_channels()
+        channels = await self._channel_ids()
         position_map = {cid: i for i, cid in enumerate(channels, start=1)}
+        statuses = statuses or {}
 
         # fake links (row positioning)
         if channels:
-            for fake in await self.db.get_fake_links():
+            for fake in await self._fake_links():
                 pos = max(0, min(int(fake.get("row", 1)) - 1, len(buttons)))
                 buttons.insert(pos, [InlineKeyboardButton(text=fake["button_text"], url=fake["url"])])
 
-        pending = 0
+        pending = []
         for cid in channels:
-            if await self.channel_joined(client, uid, cid):
-                continue  # already joined / request sent -> button hidden
-            btn = await self._channel_button(client, cid, position_map[cid])
+            joined = statuses[cid] if cid in statuses else await self.channel_joined(client, uid, cid)
+            if not joined:
+                pending.append(cid)  # joined / request-sent channels stay hidden
+
+        built = await asyncio.gather(*[self._channel_button(client, cid, position_map[cid]) for cid in pending])
+        count = 0
+        for btn in built:
             if btn:
                 buttons.append([btn])
-                pending += 1
+                count += 1
 
-        if pending == 0:
+        if count == 0:
             return None
 
         if start_param:
@@ -525,11 +625,12 @@ class FsubManager:
         when a step-by-step (auto-check) session completes.
         """
         uid = message.from_user.id
-        if await self.is_subscribed(client, uid):
+        ok, statuses = await self.check(client, uid)
+        if ok:
             return True
 
         try:
-            auto_on = await self.db.get_auto_check()
+            auto_on = await self._auto_check()
         except Exception:
             auto_on = False
 
@@ -542,16 +643,16 @@ class FsubManager:
             await self._show_stepwise(client, message, uid)
             self._start_poll(client, uid)
         else:
-            await self._show_all(client, message, uid)
+            await self._show_all(client, message, uid, statuses)
         return False
 
     # ------------------------------------------------------------------
     # normal (all-at-once) screen
     # ------------------------------------------------------------------
 
-    async def _show_all(self, client: Client, message: Message, uid: int):
+    async def _show_all(self, client: Client, message: Message, uid: int, statuses: dict = None):
         start_param = message.command[1] if getattr(message, "command", None) and len(message.command) > 1 else None
-        markup = await self._build_all_buttons(client, uid, start_param)
+        markup = await self._build_all_buttons(client, uid, start_param, statuses)
         if markup is None:
             await message.reply("<b>❌ No valid channels found. Please contact the bot owner.</b>")
             return
@@ -564,7 +665,7 @@ class FsubManager:
 
     async def _fresh_pending_order(self, client: Client, uid: int) -> list:
         pending = []
-        for cid in await self.db.show_channels():
+        for cid in await self._channel_ids():
             if not await self.channel_joined(client, uid, cid):
                 pending.append(cid)
         return pending
@@ -674,11 +775,20 @@ class FsubManager:
         elapsed = 0
         try:
             while elapsed < AUTO_CHECK_MAX_DURATION:
-                interval = AUTO_CHECK_FAST_INTERVAL if elapsed < AUTO_CHECK_FAST_WINDOW else AUTO_CHECK_POLL_INTERVAL
+                # Back off as time passes and as more people are polling at once.
+                # (Real joins / requests are detected instantly through notify_event;
+                #  polling is only the safety net.)
+                if elapsed < AUTO_CHECK_FAST_WINDOW:
+                    interval = AUTO_CHECK_FAST_INTERVAL
+                elif elapsed < 180:
+                    interval = AUTO_CHECK_POLL_INTERVAL
+                else:
+                    interval = AUTO_CHECK_POLL_INTERVAL * 3
+                interval *= 1 + len(self.poll_tasks) // 40
                 await asyncio.sleep(interval)
                 elapsed += interval
                 try:
-                    if not await self.db.get_auto_check():
+                    if not await self._auto_check():
                         return
                     status = await self._refresh_step(client, uid)
                     if status in ("finished", "no_context"):
@@ -703,12 +813,12 @@ class FsubManager:
     # ------------------------------------------------------------------
 
     async def _tutorial_if_not_joined(self, client: Client, uid: int):
-        tutorial = await self.db.get_tutorial("fsub")
+        tutorial = await self._tutorial()
         if not tutorial:
             return
         await asyncio.sleep(TUTORIAL_WAIT)
         try:
-            for cid in await self.db.show_channels():
+            for cid in await self._channel_ids():
                 if not await self.channel_joined(client, uid, cid):
                     break
             else:
@@ -787,7 +897,7 @@ class FsubManager:
         async def _join_request(client: Client, request: ChatJoinRequest):
             cid, uid = request.chat.id, request.from_user.id
             try:
-                if cid in await mgr.db.show_channels():
+                if cid in await mgr._channel_ids():
                     # Record only — never auto-approve (owner approves manually)
                     await mgr.db.req_user(cid, uid)
                     await mgr.db.inc_request_count(cid)
@@ -806,7 +916,7 @@ class FsubManager:
                 old = update.old_chat_member.status if update.old_chat_member else None
                 new = update.new_chat_member.status
                 if new in _JOINED and old not in _JOINED:
-                    if chat.id not in await mgr.db.show_channels():
+                    if chat.id not in await mgr._channel_ids():
                         return
                     asyncio.create_task(mgr.notify_event(client, user.id))
                     await mgr.db.inc_join_count(chat.id)

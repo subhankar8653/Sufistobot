@@ -1,6 +1,8 @@
 #@suhanibots
 
 import asyncio
+import time
+from datetime import datetime, timedelta
 from pyrogram import Client, filters, ContinuePropagation
 from pyrogram.handlers import MessageHandler, CallbackQueryHandler
 from pyrogram.enums import ParseMode
@@ -12,9 +14,11 @@ from pyrogram.types import (
     ChatJoinRequest,
 )
 #@suhanibots
-from config import API_ID, API_HASH, LOGGER, OWNER_ID
+from pyrogram.errors import FloodWait
+from config import API_ID, API_HASH, LOGGER, OWNER_ID, WORKER_BOT_WORKERS, WORKER_SEND_RATE
 from database.main_db import MainDB
 from database.worker_db import WorkerDB
+from worker_bot.scale import RateLimiter, SingleFlightCache, LogBatcher
 from utils.security import decrypt_token
 from utils.helpers import encode, decode, get_messages, get_message_id, get_exp_time
 #@suhanibotss
@@ -87,12 +91,42 @@ class WorkerEngine:
             api_hash=API_HASH,
             bot_token=token,
             in_memory=True,
-            workers=4,
+            workers=WORKER_BOT_WORKERS,   # updates handled in parallel (asyncio tasks, cheap)
+            sleep_threshold=60,           # FloodWait <= 60s is waited out and retried automatically
         )
 
-        # Global middleware to update last_active
+        # ---- burst protection (see worker_bot/scale.py) ----
+        send_limiter = RateLimiter(WORKER_SEND_RATE)   # user-facing sends (files)
+        bg_limiter = RateLimiter(12)                   # broadcast / auto-delete housekeeping
+        fetch_cache = SingleFlightCache(ttl=45, max_items=64)   # log-channel fetches shared by all users
+
+        async def _send_log_text(text: str):
+            await app.send_message(chat_id=log_channel_id, text=text)
+
+        new_user_log = LogBatcher(_send_log_text, interval=4.0, per_message=12)
+
+        # bot registry doc: cached for a few seconds instead of one Mongo read per /start
+        _doc_cache = {"t": 0.0, "doc": bot_doc}
+
+        async def get_current_doc() -> dict:
+            if time.monotonic() - _doc_cache["t"] > 8:
+                try:
+                    doc = await main_db.get_bot(bot_id)
+                    if doc:
+                        _doc_cache["doc"] = doc
+                except Exception as e:
+                    log.error(f"bot doc refresh failed: {e}")
+                _doc_cache["t"] = time.monotonic()
+            return _doc_cache["doc"]
+
+        # Global middleware to update last_active (at most once a minute, not once per update)
+        _last_active = [0.0]
+
         async def update_activity_middleware(client, update):
-            asyncio.create_task(main_db.update_last_active(bot_id))
+            now = time.monotonic()
+            if now - _last_active[0] > 60:
+                _last_active[0] = now
+                asyncio.create_task(main_db.update_last_active(bot_id))
             raise ContinuePropagation
 
         app.add_handler(MessageHandler(update_activity_middleware), group=-1)
@@ -134,27 +168,24 @@ class WorkerEngine:
         @app.on_message(filters.command("start") & filters.private)
         async def worker_start(client: Client, message: Message):
             user_id = message.from_user.id
-            current_bot_doc = await main_db.get_bot(bot_id) or bot_doc
+            current_bot_doc = await get_current_doc()
 
             # Track user
             if not await worker_db.present_user(user_id):
                 await worker_db.add_user(user_id)
                 
                 if log_channel_id:
-                    log_text = (
+                    # queued + batched: never blocks the user and never trips the
+                    # channel's ~20 messages/minute limit when many new users arrive
+                    new_user_log.add(
                         f"<b>#NewUser</b>\n\n"
                         f"<b>Iᴅ</b> - <code>{user_id}</code>\n"
                         f"<b>Nᴀᴍᴇ</b> - {message.from_user.first_name}\n"
                         f"<b>username</b> - @{message.from_user.username or 'N/A'}"
                     )
-                    try:
-                        await client.send_message(chat_id=log_channel_id, text=log_text)
-                    except Exception as e:
-                        log.error(f"Failed to send #NewUser log to {log_channel_id}: {e}")
 
             # Check ban
-            banned = await worker_db.get_ban_users()
-            if user_id in banned:
+            if await worker_db.ban_user_exist(user_id):
                 await message.reply(
                     "<b>━━━━━━━━━━━━━━━━━━━━━\n"
                     "⛔ 𝗔𝗖𝗖𝗘𝗦𝗦 𝗗𝗘𝗡𝗜𝗘𝗗\n"
@@ -298,7 +329,12 @@ class WorkerEngine:
                 try:
                     messages = []
                     for _ch, _ch_ids in candidates:
-                        _msgs = await get_messages(client, _ch, _ch_ids)
+                        # 100 people opening the same link = ONE fetch from the log channel
+                        _msgs = await fetch_cache.get(
+                            (_ch, tuple(_ch_ids)),
+                            lambda _c=_ch, _i=_ch_ids: get_messages(client, _c, _i),
+                            cache_if=lambda v: any(m is not None and not getattr(m, "empty", False) for m in v),
+                        )
                         if any(m is not None and not getattr(m, "empty", False) for m in _msgs):
                             messages = _msgs
                             break
@@ -353,14 +389,22 @@ class WorkerEngine:
                         caption_text = original_caption
                         
                     try:
-                        copied = await msg.copy(
-                            chat_id=user_id,
-                            caption=caption_text if caption_text else None,
-                            parse_mode=ParseMode.HTML,
-                            protect_content=protect_content,
-                        )
-                        sent_msgs.append(copied)
-                        await asyncio.sleep(0)
+                        copied = None
+                        for _attempt in range(3):
+                            await send_limiter.acquire()      # smooth, never above WORKER_SEND_RATE/s
+                            try:
+                                copied = await msg.copy(
+                                    chat_id=user_id,
+                                    caption=caption_text if caption_text else None,
+                                    parse_mode=ParseMode.HTML,
+                                    protect_content=protect_content,
+                                )
+                                break
+                            except FloodWait as fw:           # long flood: wait, then retry (don't drop the file)
+                                log.warning(f"FloodWait {fw.value}s while sending files (bot {bot_id})")
+                                await asyncio.sleep(fw.value + 1)
+                        if copied is not None:
+                            sent_msgs.append(copied)
                     except Exception as e:
                         log.error(f"Failed to copy message: {e}")
 
@@ -374,9 +418,16 @@ class WorkerEngine:
 
                     reload_url = f"https://t.me/{(await client.get_me()).username}?start={message.command[1]}" if len(message.command) > 1 else None
 
-                    asyncio.create_task(
-                        _schedule_delete(client, sent_msgs, notification, del_timer, reload_url)
-                    )
+                    try:
+                        await worker_db.add_pending_delete(
+                            user_id, [m.id for m in sent_msgs], notification.id,
+                            datetime.utcnow() + timedelta(seconds=del_timer), reload_url,
+                        )
+                    except Exception as e:
+                        log.error(f"Could not queue auto-delete, using in-memory timer: {e}")
+                        asyncio.create_task(
+                            _schedule_delete(client, sent_msgs, notification, del_timer, reload_url)
+                        )
 
             else:
                 # Normal /start - welcome message
@@ -498,13 +549,22 @@ class WorkerEngine:
             failed = 0
             
             for uid in users:
-                try:
-                    await message.reply_to_message.copy(uid)
+                sent_ok = False
+                for _attempt in range(3):
+                    await bg_limiter.acquire()   # ~12/s: leaves room for normal user traffic
+                    try:
+                        await message.reply_to_message.copy(uid)
+                        sent_ok = True
+                        break
+                    except FloodWait as fw:
+                        await asyncio.sleep(fw.value + 1)
+                    except Exception as e:
+                        log.error(f"Worker broadcast failed for user {uid}: {e}")
+                        break
+                if sent_ok:
                     success += 1
-                    await asyncio.sleep(0.1) # Small delay
-                except Exception as e:
+                else:
                     failed += 1
-                    log.error(f"Worker broadcast failed for user {uid}: {e}")
                     
             await b_msg.edit(
                 f"<b>✅ Broadcast Completed</b>\n\n"
@@ -517,9 +577,55 @@ class WorkerEngine:
         # START THE CLIENT
         # =====================================================================
 
+        # ---- persistent auto-delete sweeper (one loop for ALL users, restart-safe) ----
+        async def _run_pending_delete(d: dict):
+            chat_id, ids = d["chat_id"], d.get("msg_ids", [])
+            try:
+                for i in range(0, len(ids), 100):          # one API call deletes up to 100 messages
+                    await bg_limiter.acquire()
+                    try:
+                        await app.delete_messages(chat_id, ids[i:i + 100])
+                    except FloodWait as fw:
+                        await asyncio.sleep(fw.value + 1)
+                        await app.delete_messages(chat_id, ids[i:i + 100])
+                if d.get("notif_id"):
+                    keyboard = None
+                    if d.get("reload_url"):
+                        keyboard = InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("📥 Get File Again", url=d["reload_url"])]]
+                        )
+                    await bg_limiter.acquire()
+                    await app.edit_message_text(
+                        chat_id, d["notif_id"],
+                        "<b>🗑 Your files have been auto-deleted.</b>\n\n"
+                        "<blockquote>Click below to retrieve them again.</blockquote>",
+                        reply_markup=keyboard,
+                    )
+            except Exception as e:
+                log.error(f"auto-delete for chat {chat_id} failed: {e}")
+            finally:
+                await worker_db.remove_pending_delete(d["_id"])
+
+        async def _delete_sweeper():
+            await worker_db.ensure_indexes()
+            await asyncio.sleep(5)
+            while True:
+                try:
+                    if getattr(app, "is_connected", True):
+                        due = await worker_db.get_due_deletes(datetime.utcnow(), limit=50)
+                        for d in due:
+                            await _run_pending_delete(d)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.error(f"delete sweeper error: {e}")
+                await asyncio.sleep(10)
+
         try:
             await app.start()
             app.set_parse_mode(ParseMode.HTML)
+            app._bg_tasks = [asyncio.create_task(_delete_sweeper())]
+            app._bg_stoppers = [new_user_log.stop]
 
             # Set bot commands in the Telegram menu
             from pyrogram.types import BotCommand
@@ -546,6 +652,14 @@ class WorkerEngine:
 
         except Exception as e:
             log.error(f"Failed to start worker {bot_id}: {e}")
+            try:
+                fm = getattr(app, "_fsub_mgr", None)
+                if fm:
+                    fm.stop()
+                for t in getattr(app, "_bg_tasks", []):
+                    t.cancel()
+            except Exception:
+                pass
             raise
 
     async def stop_worker(self, bot_id: int):
@@ -558,6 +672,10 @@ class WorkerEngine:
                 fsub_mgr = getattr(app, "_fsub_mgr", None)
                 if fsub_mgr:
                     fsub_mgr.stop()   # cancel fsub maintenance / auto-check tasks
+                for t in getattr(app, "_bg_tasks", []):
+                    t.cancel()        # auto-delete sweeper
+                for stopper in getattr(app, "_bg_stoppers", []):
+                    stopper()
             except Exception:
                 pass
             try:
