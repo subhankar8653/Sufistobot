@@ -188,8 +188,14 @@ async def get_messages(client, channel_id: int, message_ids: list):
             await asyncio.sleep(e.value)
             msgs = await client.get_messages(chat_id=channel_id, message_ids=batch)
         except Exception as e:
-            log.error(f"Error fetching messages: {e}")
+            # Peer not cached yet (e.g. an older log channel after a restart):
+            # resolve it once and retry before giving up.
             msgs = []
+            try:
+                await client.get_chat(channel_id)
+                msgs = await client.get_messages(chat_id=channel_id, message_ids=batch)
+            except Exception as e2:
+                log.error(f"Error fetching messages from {channel_id}: {e} / {e2}")
         total += len(batch)
         if isinstance(msgs, list):
             messages.extend(msgs)
