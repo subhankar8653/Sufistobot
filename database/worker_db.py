@@ -212,6 +212,53 @@ class WorkerDB:
             "request_count": data.get("request_count", 0) if data else 0,
         }
 
+    # ---- full channel docs + auto-remove / request target / link rotation ----
+
+    async def get_channel_doc(self, channel_id: int):
+        return await self.channels.find_one({"_id": channel_id})
+
+    async def get_all_channel_docs(self) -> list:
+        return await self.channels.find().sort("created_at", 1).to_list(length=None)
+
+    async def set_remove_at(self, channel_id: int, when):
+        """Schedule automatic removal from fsub (naive UTC datetime), or None to clear."""
+        if when:
+            res = await self.channels.update_one({"_id": channel_id}, {"$set": {"remove_at": when}})
+        else:
+            res = await self.channels.update_one({"_id": channel_id}, {"$unset": {"remove_at": ""}})
+        return res.matched_count > 0
+
+    async def set_request_limit(self, channel_id: int, limit: int) -> bool:
+        """Auto-remove the channel once `limit` NEW requests (request mode) / joins
+        (normal mode) arrived from now on. limit=0 clears it."""
+        doc = await self.channels.find_one({"_id": channel_id})
+        if not doc:
+            return False
+        if limit and limit > 0:
+            await self.channels.update_one({"_id": channel_id}, {"$set": {
+                "request_limit": int(limit),
+                "limit_base_req": doc.get("request_count", 0),
+                "limit_base_join": doc.get("join_count", 0),
+            }})
+        else:
+            await self.channels.update_one({"_id": channel_id}, {"$unset": {
+                "request_limit": "", "limit_base_req": "", "limit_base_join": "",
+            }})
+        return True
+
+    async def set_link_rotation(self, channel_id: int, hours: int) -> bool:
+        """Every `hours` hours: expire the old invite link and create a new one. 0 = off."""
+        from datetime import datetime
+        if hours and hours > 0:
+            res = await self.channels.update_one({"_id": channel_id}, {"$set": {
+                "rotate_hours": int(hours), "rotate_since": datetime.utcnow(),
+            }})
+        else:
+            res = await self.channels.update_one({"_id": channel_id}, {"$unset": {
+                "rotate_hours": "", "rotate_since": "",
+            }})
+        return res.matched_count > 0
+
     # ---- permanent (non-expiring) invite link cache ----
 
     async def get_invite_link(self, channel_id: int):
@@ -225,9 +272,14 @@ class WorkerDB:
         return None
 
     async def save_invite_link(self, channel_id: int, invite_link: str, is_request: bool):
+        from datetime import datetime
         await self.channels.update_one(
             {"_id": channel_id},
-            {"$set": {"invite_link": invite_link, "invite_is_request": bool(is_request)}},
+            {"$set": {
+                "invite_link": invite_link,
+                "invite_is_request": bool(is_request),
+                "invite_created_at": datetime.utcnow(),
+            }},
         )
 
     async def clear_invite_link(self, channel_id: int):
