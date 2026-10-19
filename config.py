@@ -62,6 +62,10 @@ PORT = int(os.environ.get("PORT", "8080"))
 # Maximum number of bots a single user can create
 MAX_BOTS_PER_USER = int(os.environ.get("MAX_BOTS_PER_USER", "5"))
 
+# Timezone used when the owner types a clock time for fsub auto-remove ("12:00").
+# Minutes from UTC. India (IST) = 330. Example: UTC = 0, Dubai = 240.
+FSUB_TZ_OFFSET_MIN = int(os.environ.get("FSUB_TZ_OFFSET_MIN", "330"))
+
 # Default auto-delete time for files (in seconds, 0 = disabled)
 DEFAULT_AUTO_DELETE = int(os.environ.get("DEFAULT_AUTO_DELETE", "0"))
 
