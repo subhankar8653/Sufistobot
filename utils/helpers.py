@@ -244,7 +244,7 @@ async def upload_to_telegraph(client: Client, message: Message) -> str | None:
         if 'file_path' in locals() and file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
-            except:
+            except OSError:
                 pass
 
 async def send_main_log(client: Client, text: str):
