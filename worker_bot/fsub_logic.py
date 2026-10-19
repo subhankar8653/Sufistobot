@@ -19,6 +19,7 @@ Everything is per worker bot (isolated through WorkerDB).
 """
 
 import asyncio
+import html
 import re
 import time
 from collections import defaultdict
@@ -124,6 +125,32 @@ def parse_remove_time(text: str):
     if result is None or result <= now:
         return None
     return result
+
+
+FSUB_TEXT_MAX = 700   # keeps photo captions safely under Telegram's 1024-char limit
+
+
+def render_fsub_text(text: str, user) -> str:
+    """Admin-written fsub instruction -> safe HTML, ALWAYS bold.
+
+    The text is HTML-escaped (so stray < or & can never break the message) and wrapped in <b>.
+    Placeholders: {mention} {first} {last} {id} {username}
+    """
+    safe = html.escape(text.strip(), quote=False)
+    first = getattr(user, "first_name", "") or ""
+    last = getattr(user, "last_name", "") or ""
+    uname = getattr(user, "username", "") or ""
+    mention = getattr(user, "mention", None) or html.escape(first or "User", quote=False)
+    mapping = {
+        "{mention}": mention,
+        "{first}": html.escape(first, quote=False),
+        "{last}": html.escape(last, quote=False),
+        "{id}": str(getattr(user, "id", "")),
+        "{username}": f"@{uname}" if uname else "",
+    }
+    for key, value in mapping.items():
+        safe = safe.replace(key, value)
+    return f"<b>{safe}</b>"
 
 
 def _is_real_pic(value) -> bool:
@@ -347,9 +374,11 @@ class FsubManager:
     # ------------------------------------------------------------------
 
     async def _settings(self) -> dict:
-        try:
+        async def load():
             doc = await main_db.get_bot(self.bot_id)
             return (doc or {}).get("settings", {}) or {}
+        try:
+            return await self._sf.get("bot_settings", load, ttl=DOCS_TTL)
         except Exception:
             return {}
 
@@ -603,6 +632,18 @@ class FsubManager:
             "ᴛᴀᴘ 🔵 ʙᴜᴛᴛᴏɴ ᴛᴏ ᴄʜᴇᴄᴋ ɪɴsᴛᴀɴᴛʟʏ.</blockquote>"
         )
 
+    async def _caption_all(self, user) -> str:
+        custom = ((await self._settings()).get("fsub_text") or "").strip()
+        if custom:
+            return render_fsub_text(custom, user)
+        return self._all_caption(user.mention)
+
+    async def _caption_step(self, user, step_num: int, total: int) -> str:
+        custom = ((await self._settings()).get("fsub_text") or "").strip()
+        if custom:
+            return f"{render_fsub_text(custom, user)}\n\n📍 <b>Step {step_num:02d}/{total:02d}</b>"
+        return self._step_caption(user.mention, step_num, total)
+
     async def _send_ui(self, message: Message, caption: str, markup):
         settings = await self._settings()
         pic = settings.get("force_pic", "")
@@ -656,7 +697,7 @@ class FsubManager:
         if markup is None:
             await message.reply("<b>❌ No valid channels found. Please contact the bot owner.</b>")
             return
-        await self._send_ui(message, self._all_caption(message.from_user.mention), markup)
+        await self._send_ui(message, await self._caption_all(message.from_user), markup)
         asyncio.create_task(self._tutorial_if_not_joined(client, uid))
 
     # ------------------------------------------------------------------
@@ -677,7 +718,7 @@ class FsubManager:
                 pending.append(cid)
         return pending
 
-    async def _build_next_step(self, client: Client, mention: str, order: list, pending: list, total: int):
+    async def _build_next_step(self, client: Client, user, order: list, pending: list, total: int):
         for cid in pending:
             step_num = order.index(cid) + 1
             btn = await self._channel_button(client, cid, step_num, stepwise=True)
@@ -686,7 +727,7 @@ class FsubManager:
                     [btn],
                     [InlineKeyboardButton("🔵 Mᴀɪɴᴇ Jᴏɪɴ Kᴀʀ Lɪʏᴀ", callback_data="fsub_stepcheck")],
                 ])
-                return step_num, self._step_caption(mention, step_num, total), markup
+                return step_num, await self._caption_step(user, step_num, total), markup
         return None
 
     async def _show_stepwise(self, client: Client, message: Message, uid: int):
@@ -742,7 +783,7 @@ class FsubManager:
         orig = ctx.get("message")
         if orig is None:
             return "error"
-        built = await self._build_next_step(client, orig.from_user.mention, order, pending, total)
+        built = await self._build_next_step(client, orig.from_user, order, pending, total)
         if built is None:
             return "error"
         step_num, caption, markup = built
