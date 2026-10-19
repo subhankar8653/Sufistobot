@@ -188,27 +188,52 @@ class WorkerEngine:
                 except IndexError:
                     return
 
-                string = await decode(base64_string)
+                _bad_link = (
+                    "<b>━━━━━━━━━━━━━━━━━━━━━\n"
+                    "❌ 𝗜𝗡𝗩𝗔𝗟𝗜𝗗 𝗟𝗜𝗡𝗞\n"
+                    "━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                    "<blockquote>ᴛʜɪs ʟɪɴᴋ ɪs ɪɴᴠᴀʟɪᴅ ᴏʀ ʜᴀs ʙᴇᴇɴ ʀᴇᴍᴏᴠᴇᴅ.</blockquote>"
+                )
+                try:
+                    string = await decode(base64_string)
+                except Exception as e:
+                    log.error(f"Bad deep link: {e}")
+                    await message.reply(_bad_link)
+                    return
                 argument = string.split("-")
 
-                ids = []
-                if len(argument) == 3:
-                    try:
-                        start = int(int(argument[1]) / abs(log_channel_id))
-                        end = int(int(argument[2]) / abs(log_channel_id))
-                        ids = list(range(start, end + 1)) if start <= end else list(range(start, end - 1, -1))
-                    except Exception as e:
-                        log.error(f"Error decoding IDs: {e}")
-                        return
-                elif len(argument) == 2:
-                    try:
-                        ids = [int(int(argument[1]) / abs(log_channel_id))]
-                    except Exception as e:
-                        log.error(f"Error decoding ID: {e}")
-                        return
+                # Candidate log channels: the CURRENT one first, then older ones.
+                # A link encodes (message_id x channel_id), so links created before the
+                # log channel was changed (or before a data transfer) still resolve
+                # against the channel they were made for.
+                cur_channel = current_bot_doc.get("log_channel_id") or log_channel_id
+                chan_list = [cur_channel] + [
+                    c for c in current_bot_doc.get("previous_log_channels", []) if c != cur_channel
+                ]
+                try:
+                    nums = [int(x) for x in argument[1:]]
+                except ValueError:
+                    nums = []
 
-                if not ids:
+                candidates = []  # [(channel_id, ids)]
+                if len(argument) in (2, 3) and nums:
+                    for ch in chan_list:
+                        mult = abs(int(ch))
+                        if mult and all(n > 0 and n % mult == 0 for n in nums):
+                            q = [n // mult for n in nums]
+                            if len(q) == 2:
+                                st, en = q
+                                ch_ids = list(range(st, en + 1)) if st <= en else list(range(st, en - 1, -1))
+                            else:
+                                ch_ids = q
+                            if ch_ids:
+                                candidates.append((ch, ch_ids))
+
+                if not candidates:
+                    log.warning(f"Link did not match any log channel of bot {bot_id}: {string}")
+                    await message.reply(_bad_link)
                     return
+                ids = candidates[0][1]
 
                 # ---- SHORTENER VERIFICATION GATE ----
                 shortener_cfg = current_bot_doc.get("shortener", {})
@@ -271,7 +296,12 @@ class WorkerEngine:
                         "<b>⏳ ʟᴏᴀᴅɪɴɢ ʏᴏᴜʀ ꜰɪʟᴇs...</b>"
                     )
                 try:
-                    messages = await get_messages(client, log_channel_id, ids)
+                    messages = []
+                    for _ch, _ch_ids in candidates:
+                        _msgs = await get_messages(client, _ch, _ch_ids)
+                        if any(m is not None and not getattr(m, "empty", False) for m in _msgs):
+                            messages = _msgs
+                            break
                 except Exception as e:
                     await message.reply(
                         "<b>━━━━━━━━━━━━━━━━━━━━━\n"
@@ -287,6 +317,16 @@ class WorkerEngine:
                             await temp_msg.delete()
                         except Exception:
                             pass
+
+                if not any(m is not None and not getattr(m, "empty", False) for m in messages):
+                    await message.reply(
+                        "<b>━━━━━━━━━━━━━━━━━━━━━\n"
+                        "❌ 𝗙𝗜𝗟𝗘𝗦 𝗡𝗢𝗧 𝗙𝗢𝗨𝗡𝗗\n"
+                        "━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+                        "<blockquote>ᴛʜᴇ ꜰɪʟᴇs ꜰᴏʀ ᴛʜɪs ʟɪɴᴋ ᴀʀᴇ ɴᴏ ʟᴏɴɢᴇʀ ᴀᴠᴀɪʟᴀʙʟᴇ.\n"
+                        "ᴀsᴋ ᴛʜᴇ ʙᴏᴛ ᴏᴡɴᴇʀ ᴛᴏ ᴄʜᴇᴄᴋ ᴛʜᴇ ʟᴏɢ ᴄʜᴀɴɴᴇʟ.</blockquote>"
+                    )
+                    return
 
                 settings = current_bot_doc.get("settings", {})
                 protect_content = settings.get("protect_content", False)
@@ -374,6 +414,36 @@ class WorkerEngine:
         # =====================================================================
         # HANDLER: /ban & /unban (admin only)
         # =====================================================================
+
+        @app.on_message(filters.command("oldchannel") & filters.private)
+        async def handle_oldchannel(client: Client, message: Message):
+            """/oldchannel <id>  — make links created for an OLDER log channel work again.
+            /oldchannel        — list the remembered older channels."""
+            if not await is_admin(message.from_user.id):
+                return
+            if len(message.command) < 2:
+                olds = await main_db.get_old_log_channels(bot_id)
+                lst = "\n".join(f"• <code>{c}</code>" for c in olds) or "<i>none</i>"
+                await message.reply(
+                    "<b>🗂 Older log channels</b>\n\n"
+                    f"<blockquote>{lst}</blockquote>\n"
+                    "<b>Usage:</b> <code>/oldchannel -1001234567890</code>\n"
+                    "<i>Add the log channel your old links were made with "
+                    "(this bot must still be admin there).</i>"
+                )
+                return
+            try:
+                ch = int(message.command[1])
+            except ValueError:
+                await message.reply("<b>❌ Invalid channel ID.</b>")
+                return
+            await main_db.add_old_log_channels(bot_id, [ch])
+            note = ""
+            try:
+                await client.get_chat(ch)
+            except Exception:
+                note = "\n\n⚠️ <i>I can't access that channel right now — make sure this bot is an admin there.</i>"
+            await message.reply(f"<b>✅ Old channel <code>{ch}</code> saved. Old links will now be tried against it.</b>{note}")
 
         @app.on_message(filters.command("ban") & filters.private)
         async def handle_ban(client: Client, message: Message):
