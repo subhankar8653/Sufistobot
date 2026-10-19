@@ -7,7 +7,7 @@ Manages the registry of user-created bots and main bot users.
 
 from datetime import datetime, timezone
 from database.mongo import get_db
-from config import LOGGER
+from config import LOGGER, OWNER_ID
 #@suhanibots
 log = LOGGER(__name__)
 
@@ -139,57 +139,48 @@ class MainDB:
         """Get a bot by its encrypted token."""
         return await self.bots.find_one({"bot_token_encrypted": token_encrypted})
 
-    # ---- access model (TEAM) ------------------------------------------------
-    # Owner <-> admin links form a TEAM. Everyone connected through those links
-    # (owner of a bot, its admins, the bots those admins created, and so on)
-    # sees and controls ALL the team's bots from one "My Bots" list, and the
-    # 5-bot limit is counted for the whole team. `admin_ids` on each registry doc
-    # mirrors the per-bot admins collection so this can be resolved with queries.
+    # ---- access model ---------------------------------------------------------
+    # * OWNER_ID (super owner): sees + edits + deletes EVERY bot.
+    # * Other approved admins: can open/edit only bots they created (or where
+    #   they were explicitly added as a bot admin). Everyone else's bots are
+    #   shown as locked slots (visible, not clickable).
+    # * The bot limit (MAX_BOTS_PER_USER, default 5) is GLOBAL: it counts every
+    #   active bot no matter how many admins exist.
+
+    @staticmethod
+    def is_super(user_id: int) -> bool:
+        return bool(OWNER_ID) and user_id == OWNER_ID
 
     @staticmethod
     def is_owner(bot: dict, user_id: int) -> bool:
-        """True only for the user who created / owns this exact bot."""
-        return bool(bot) and bot.get("owner_id") == user_id
-
-    async def get_team(self, user_id: int):
-        """Return (team_user_ids:set, team_bots:dict[bot_id -> doc]) for a user."""
-        users = {user_id}
-        bots = {}
-        frontier = [user_id]
-        while frontier:
-            cursor = self.bots.find({
-                "$or": [{"owner_id": {"$in": frontier}}, {"admin_ids": {"$in": frontier}}],
-                "is_deleted": {"$ne": True},
-            })
-            new_users = set()
-            async for b in cursor:
-                bots[b["_id"]] = b
-                for u in [b.get("owner_id")] + list(b.get("admin_ids") or []):
-                    if u is not None and u not in users:
-                        new_users.add(u)
-            users |= new_users
-            frontier = list(new_users)
-        return users, bots
-
-    async def can_manage(self, bot: dict, user_id: int) -> bool:
-        """Owner, admin, or any member of the team this bot belongs to."""
+        """True for the bot's creator, and always for the super owner (OWNER_ID)."""
         if not bot:
             return False
-        if bot.get("owner_id") == user_id or user_id in (bot.get("admin_ids") or []):
+        return bot.get("owner_id") == user_id or (bool(OWNER_ID) and user_id == OWNER_ID)
+
+    async def get_all_bots(self) -> list:
+        """Every non-deleted bot, oldest first (this defines slot 01, 02, ...)."""
+        docs = await self.bots.find({"is_deleted": {"$ne": True}}).to_list(length=None)
+        return sorted(docs, key=lambda b: b.get("created_at") or 0)
+
+    async def can_manage(self, bot: dict, user_id: int) -> bool:
+        """Super owner, the bot's creator, or an admin added to this bot."""
+        if not bot:
+            return False
+        if self.is_super(user_id):
             return True
-        _, team_bots = await self.get_team(user_id)
-        return bot["_id"] in team_bots
+        return bot.get("owner_id") == user_id or user_id in (bot.get("admin_ids") or [])
 
     async def get_user_bots(self, user_id: int) -> list:
-        """ALL active bots of the user's team (own + admin-of + teammates' bots)."""
-        _, team_bots = await self.get_team(user_id)
-        return sorted(team_bots.values(), key=lambda b: b.get("created_at") or 0)
+        """Bots this user may OPEN (super owner: all)."""
+        bots = await self.get_all_bots()
+        if self.is_super(user_id):
+            return bots
+        return [b for b in bots if b.get("owner_id") == user_id or user_id in (b.get("admin_ids") or [])]
 
     async def count_user_bots(self, user_id: int) -> int:
-        """Bots in the user's whole team — this is what the 5-bot limit counts, so
-        making another account admin can never be used to dodge the limit."""
-        _, team_bots = await self.get_team(user_id)
-        return len(team_bots)
+        """GLOBAL count of active bots (user_id kept for compatibility)."""
+        return await self.bots.count_documents({"is_deleted": {"$ne": True}})
 
     async def add_bot_admin(self, bot_id: int, admin_id: int):
         await self.bots.update_one({"_id": bot_id}, {"$addToSet": {"admin_ids": int(admin_id)}})
