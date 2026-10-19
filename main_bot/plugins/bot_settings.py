@@ -36,7 +36,7 @@ async def _verify_ownership(query: CallbackQuery, bot_id: int, owner_only: bool 
     bot = await main_db.get_bot(bot_id)
     uid = query.from_user.id
     allowed = bool(bot) and (
-        main_db.is_owner(bot, uid) if owner_only else main_db.can_manage(bot, uid)
+        main_db.is_owner(bot, uid) if owner_only else await main_db.can_manage(bot, uid)
     )
     if not allowed:
         await query.answer("❌ Access denied!", show_alert=True)
@@ -1117,8 +1117,8 @@ async def handle_admin_input(client: Client, message: Message, state: dict):
 
     await message.reply(
         f"<b>✅ Admin <code>{admin_id}</code> added!</b>\n\n"
-        f"<blockquote>They can now see and manage this bot from <b>My Bots</b>. "
-        f"It also counts toward their {MAX_BOTS_PER_USER}-bot limit.</blockquote>",
+        f"<blockquote>You are now one team: both of you see and control ALL each other's bots "
+        f"from <b>My Bots</b>. The {MAX_BOTS_PER_USER}-bot limit is shared by the whole team.</blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Back", callback_data=f"admins_{bot_id}")],
         ]),

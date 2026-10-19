@@ -68,7 +68,7 @@ async def my_bots_callback(client: Client, query: CallbackQuery):
         f"📋 𝗠𝗬 𝗕𝗢𝗧𝗦  [{len(bots)}/{MAX_BOTS_PER_USER}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
         f"<blockquote>sᴇʟᴇᴄᴛ ᴀ ʙᴏᴛ ᴛᴏ ᴏᴘᴇɴ ɪᴛs ᴅᴀsʜʙᴏᴀʀᴅ.\n"
-        f"👑 = ᴏᴡɴᴇʀ   🛡 = ᴀᴅᴍɪɴ</blockquote>",
+        f"👑 = ʏᴏᴜʀ ʙᴏᴛ   🛡 = ᴛᴇᴀᴍ / ᴀᴅᴍɪɴ ʙᴏᴛ</blockquote>",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
     await query.answer()
@@ -95,7 +95,7 @@ async def dashboard_callback(client: Client, query: CallbackQuery):
 
     # Verify ownership
     bot = await main_db.get_bot(bot_id)
-    if not bot or not main_db.can_manage(bot, user_id):
+    if not bot or not await main_db.can_manage(bot, user_id):
         await query.answer("❌ Bot not found or access denied!", show_alert=True)
         return
 
@@ -132,7 +132,7 @@ async def dashboard_callback(client: Client, query: CallbackQuery):
     is_owner = main_db.is_owner(bot, user_id)
     if not is_owner:
         text += (
-            f"\n<blockquote>🛡 ʏᴏᴜ ᴀʀᴇ ᴀɴ <b>ᴀᴅᴍɪɴ</b> ᴏꜰ ᴛʜɪs ʙᴏᴛ\n"
+            f"\n<blockquote>🛡 ᴛᴇᴀᴍ ʙᴏᴛ — ʏᴏᴜ ᴍᴀɴᴀɢᴇ ɪᴛ ᴀs ᴀᴅᴍɪɴ / ᴛᴇᴀᴍ ᴍᴇᴍʙᴇʀ\n"
             f"👑 ᴏᴡɴᴇʀ: <code>{bot.get('owner_id')}</code></blockquote>"
         )
 
@@ -200,7 +200,7 @@ async def toggle_bot_callback(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or not main_db.can_manage(bot, user_id):
+    if not bot or not await main_db.can_manage(bot, user_id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 
@@ -249,7 +249,7 @@ async def toggle_protect_callback(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or not main_db.can_manage(bot, user_id):
+    if not bot or not await main_db.can_manage(bot, user_id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 
@@ -283,7 +283,7 @@ async def toggle_permanent_link_callback(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
 
     bot = await main_db.get_bot(bot_id)
-    if not bot or not main_db.can_manage(bot, user_id):
+    if not bot or not await main_db.can_manage(bot, user_id):
         await query.answer("❌ Access denied!", show_alert=True)
         return
 
