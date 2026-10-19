@@ -361,6 +361,19 @@ class WorkerDB:
         )
 
     # =========================================================================
+    # FSUB BUTTON LAYOUT: 1 (one button per row, default) or 2 (two per row)
+    # =========================================================================
+
+    async def get_fsub_layout(self) -> int:
+        doc = await self.fsub_cfg.find_one({"_id": "layout"})
+        return 2 if doc and int(doc.get("per_row", 1)) == 2 else 1
+
+    async def set_fsub_layout(self, per_row: int):
+        await self.fsub_cfg.update_one(
+            {"_id": "layout"}, {"$set": {"per_row": 2 if int(per_row) == 2 else 1}}, upsert=True
+        )
+
+    # =========================================================================
     # FSUB CHECK DURATION (cooldown)  (OFF by default)
     # ON + hours -> once a user passes fsub, no re-check for that many hours,
     # even if new fsub channels get added.
