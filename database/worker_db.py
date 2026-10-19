@@ -29,6 +29,7 @@ class WorkerDB:
         self.fsub_cfg = db[f"{prefix}_fsub_cfg"]          # auto_check / check_duration settings
         self.fake_links = db[f"{prefix}_fake_links"]      # fake (extra) buttons shown on fsub screen
         self.tutorials = db[f"{prefix}_tutorials"]        # fsub tutorial video
+        self.pending_del = db[f"{prefix}_pending_del"]    # auto-delete queue (survives restarts)
 
     # =========================================================================
     # USER TRACKING
@@ -259,6 +260,30 @@ class WorkerDB:
             }})
         return res.matched_count > 0
 
+    # =========================================================================
+    # AUTO-DELETE QUEUE (persistent: survives restarts / hibernation)
+    # =========================================================================
+
+    async def ensure_indexes(self):
+        try:
+            await self.pending_del.create_index("delete_at")
+        except Exception as e:
+            log.error(f"ensure_indexes failed: {e}")
+
+    async def add_pending_delete(self, chat_id: int, msg_ids: list, notif_id, delete_at, reload_url=None):
+        await self.pending_del.insert_one({
+            "chat_id": chat_id, "msg_ids": list(msg_ids), "notif_id": notif_id,
+            "delete_at": delete_at, "reload_url": reload_url,
+        })
+
+    async def get_due_deletes(self, now, limit: int = 50) -> list:
+        cursor = self.pending_del.find({"delete_at": {"$lte": now}})
+        docs = await cursor.to_list(length=limit)
+        return docs
+
+    async def remove_pending_delete(self, doc_id):
+        await self.pending_del.delete_one({"_id": doc_id})
+
     # ---- permanent (non-expiring) invite link cache ----
 
     async def get_invite_link(self, channel_id: int):
@@ -474,7 +499,10 @@ class WorkerDB:
         stats = {}
 
         collections = await db.list_collection_names()
-        source_collections = [c for c in collections if c.startswith(source_prefix + "_")]
+        source_collections = [
+            c for c in collections
+            if c.startswith(source_prefix + "_") and not c.endswith("_pending_del")
+        ]
 
         for src_col_name in source_collections:
             suffix = src_col_name[len(source_prefix):]  # e.g. "_users"
