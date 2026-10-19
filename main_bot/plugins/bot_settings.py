@@ -290,6 +290,7 @@ async def _show_fsub_menu(query: CallbackQuery, bot_id: int):
     channels = await worker_db.show_channels()
     auto_on = await worker_db.get_auto_check()
     dur = await worker_db.get_fsub_check_duration()
+    layout = await worker_db.get_fsub_layout()
 
     if channels:
         channel_list = ""
@@ -317,7 +318,8 @@ async def _show_fsub_menu(query: CallbackQuery, bot_id: int):
         f"<b>🔗 Force Subscribe Settings</b>\n\n"
         f"<blockquote><b>Channels:</b>\n{channel_list}</blockquote>\n"
         f"<blockquote>🤖 <b>Auto Check:</b> {'ON' if auto_on else 'OFF'}\n"
-        f"⏱ <b>Check Duration:</b> {dur_line}</blockquote>",
+        f"⏱ <b>Check Duration:</b> {dur_line}\n"
+        f"🧩 <b>Button Layout:</b> {layout} per row</blockquote>",
         InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("➕ Add Channel", callback_data=f"add_fsub_{bot_id}"),
@@ -331,6 +333,10 @@ async def _show_fsub_menu(query: CallbackQuery, bot_id: int):
             [InlineKeyboardButton("⏳ Auto Remove / Link Rotate", callback_data=f"fsubsch_{bot_id}")],
             [InlineKeyboardButton("📝 Edit Fsub Text", callback_data=f"fsubtxt_{bot_id}")],
             [InlineKeyboardButton("⏱ Check Duration", callback_data=f"fsubdur_{bot_id}")],
+            [
+                InlineKeyboardButton(f"{'✅ ' if layout == 1 else ''}1 Row = 1 Button", callback_data=f"fsublay_{bot_id}_1"),
+                InlineKeyboardButton(f"{'✅ ' if layout == 2 else ''}1 Row = 2 Buttons", callback_data=f"fsublay_{bot_id}_2"),
+            ],
             [InlineKeyboardButton(
                 f"🤖 Auto Check: {'ON ✅' if auto_on else 'OFF ❌'}",
                 callback_data=f"fsubauto_{bot_id}",
@@ -668,6 +674,26 @@ async def fsub_auto_callback(client: Client, query: CallbackQuery):
         "✅ Auto Check ON — users see one channel at a time, next step appears automatically."
         if new_val else
         "✅ Auto Check OFF — all channels are shown at once.",
+        show_alert=True,
+    )
+    await _show_fsub_menu(query, bot_id)
+
+
+@Client.on_callback_query(filters.regex(r"^fsublay_(\d+)_([12])$"))
+async def fsub_layout_callback(client: Client, query: CallbackQuery):
+    m = re.match(r"^fsublay_(\d+)_([12])$", query.data)
+    bot_id, per_row = int(m.group(1)), int(m.group(2))
+    bot = await _verify_ownership(query, bot_id)
+    if not bot:
+        return
+    worker_db = WorkerDB(bot_id)
+    if await worker_db.get_fsub_layout() == per_row:
+        await query.answer("Already selected.")
+        return
+    await worker_db.set_fsub_layout(per_row)
+    await query.answer(
+        "✅ 2 buttons per row (request channels show as 'Req')." if per_row == 2
+        else "✅ 1 button per row.",
         show_alert=True,
     )
     await _show_fsub_menu(query, bot_id)
