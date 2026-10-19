@@ -802,7 +802,10 @@ def _invalidate_fsub_cache(bot_id: int):
 async def _show_fsub_text_menu(query: CallbackQuery, bot_id: int):
     import html as _html
     bot = await main_db.get_bot(bot_id)
-    current = ((bot or {}).get("settings", {}) or {}).get("fsub_text", "") or ""
+    cfg = (bot or {}).get("settings", {}) or {}
+    current = cfg.get("fsub_text", "") or ""
+    pic = cfg.get("force_pic", "") or ""
+    pic_txt = "✅ Set" if pic and str(pic).lower() not in ("none", "ɴᴏɴᴇ", "0") else "None"
     shown = (
         f"<blockquote>{_html.escape(current, quote=False)}</blockquote>"
         if current else "<i>Default text</i>"
@@ -816,13 +819,61 @@ async def _show_fsub_text_menu(query: CallbackQuery, bot_id: int):
         "Placeholders you can use:\n"
         "<code>{mention}</code> <code>{first}</code> <code>{last}</code> "
         "<code>{id}</code> <code>{username}</code></blockquote>\n"
+        f"<b>Photo:</b> {pic_txt}\n"
         f"<b>Current:</b>\n{shown}",
         InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Edit Text", callback_data=f"fsubtxte_{bot_id}")],
-            [InlineKeyboardButton("♻️ Reset to Default", callback_data=f"fsubtxtr_{bot_id}")],
+            [
+                InlineKeyboardButton("✏️ Edit Text", callback_data=f"fsubtxte_{bot_id}"),
+                InlineKeyboardButton("🖼 Photo", callback_data=f"fsubpic_{bot_id}"),
+            ],
+            [
+                InlineKeyboardButton("👁 Preview", callback_data=f"fsubprev_{bot_id}"),
+                InlineKeyboardButton("♻️ Reset to Default", callback_data=f"fsubtxtr_{bot_id}"),
+            ],
             [InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")],
         ]),
     )
+
+
+async def _send_fsub_preview(client: Client, user, chat_id: int, bot_id: int, back_markup=None):
+    """Send exactly what a user will see on the fsub screen (photo + text + buttons)."""
+    from worker_bot.fsub_logic import FsubManager, _is_real_pic
+    bot = await main_db.get_bot(bot_id)
+    cfg = (bot or {}).get("settings", {}) or {}
+    custom = (cfg.get("fsub_text") or "").strip()
+    caption = render_fsub_text(custom, user) if custom else FsubManager._all_caption(user.mention)
+    pic = cfg.get("force_pic", "")
+
+    worker_db = WorkerDB(bot_id)
+    channels = await worker_db.show_channels()
+    layout = await worker_db.get_fsub_layout()
+    btns = []
+    for i, cid in enumerate(channels[:6] or [0, 0, 0], start=1):
+        mode = await worker_db.get_channel_mode(cid) if cid else "off"
+        name = await worker_db.get_channel_name(cid) if cid else None
+        if layout == 2:
+            text = name or f"⚡ {'Req' if mode == 'on' else 'Join'} Channel {i} ⚡"
+        else:
+            text = name or f"⚡ {'Request' if mode == 'on' else 'Join'} channel {i:02d} ⚡"
+        btns.append(InlineKeyboardButton(text, url="https://t.me/telegram"))
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)] if layout == 2 else [[b] for b in btns]
+    rows.append([InlineKeyboardButton("• Jᴏɪɴᴇᴅ •", url="https://t.me/telegram")])
+    if back_markup:
+        rows.extend(back_markup.inline_keyboard)
+    markup = InlineKeyboardMarkup(rows)
+
+    await client.send_message(chat_id, "<b>👁 Preview — users will see this:</b>")
+    if _is_real_pic(pic):
+        try:
+            await client.send_photo(chat_id, photo=pic, caption=caption, reply_markup=markup)
+            return
+        except Exception as e:
+            await client.send_message(
+                chat_id,
+                f"<b>⚠️ Photo could not be sent</b> (<code>{str(e)[:100]}</code>). "
+                "Users will see the text only:",
+            )
+    await client.send_message(chat_id, caption, reply_markup=markup)
 
 
 @Client.on_callback_query(filters.regex(r"^fsubtxt_(\d+)$"))
@@ -868,8 +919,33 @@ async def handle_fsub_text_input(client: Client, message: Message, state: dict):
     await main_db.update_setting(bot_id, "fsub_text", text)
     _invalidate_fsub_cache(bot_id)
     _get_state().pop(user_id, None)
-    await message.reply("<b>✅ Fsub text saved!</b>\n\n<b>Preview:</b>")
-    await message.reply(render_fsub_text(text, message.from_user), reply_markup=back)
+    await message.reply("<b>✅ Fsub text saved!</b>")
+    await _send_fsub_preview(client, message.from_user, message.chat.id, bot_id, back_markup=back)
+
+
+@Client.on_callback_query(filters.regex(r"^fsubpic_(\d+)$"))
+async def fsub_pic_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubpic_(\d+)$", query.data)
+    if not await _verify_ownership(query, bot_id):
+        return
+    _get_state()[query.from_user.id] = {"step": "settings", "action": "set_fsubpic", "data": {"bot_id": bot_id}}
+    await query.message.edit_text(
+        "<b>🖼 Send the Fsub Photo (as an image or a direct link):</b>\n\n"
+        "<blockquote>It is shown above the fsub text and join buttons.\n"
+        "Send <code>0</code> to remove the photo.</blockquote>\n\n"
+        "<i>Or click Cancel to abort.</i>",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"fsubtxt_{bot_id}")]]),
+    )
+    await query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^fsubprev_(\d+)$"))
+async def fsub_preview_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubprev_(\d+)$", query.data)
+    if not await _verify_ownership(query, bot_id):
+        return
+    await query.answer()
+    await _send_fsub_preview(client, query.from_user, query.message.chat.id, bot_id)
 
 
 @Client.on_callback_query(filters.regex(r"^fsubtxtr_(\d+)$"))
@@ -1691,6 +1767,27 @@ async def handle_startcfg_input(client: Client, message: Message, state: dict):
         
         await main_db.update_setting(bot_id, "start_pic", pic_url)
         await message.reply("<b>✅ Start photo updated!</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"startcfg_{bot_id}")]]))
+
+    elif action == "set_fsubpic":
+        pic_url = ""
+        if message.photo or message.document:
+            pic_url = await upload_to_telegraph(client, message)
+            if not pic_url:
+                return  # error already sent by helper
+        elif message.text:
+            pic_url = "" if message.text.strip() == "0" else message.text.strip()
+        else:
+            await message.reply("<b>❌ Please send a photo or a link.</b>")
+            return
+
+        await main_db.update_setting(bot_id, "force_pic", pic_url)
+        _invalidate_fsub_cache(bot_id)
+        _get_state().pop(user_id, None)
+        back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"fsubtxt_{bot_id}")]])
+        await message.reply(
+            "<b>✅ Fsub photo updated!</b>" if pic_url else "<b>✅ Fsub photo removed!</b>"
+        )
+        await _send_fsub_preview(client, message.from_user, message.chat.id, bot_id, back_markup=back)
 
     elif action == "set_custom_caption":
         new_text = message.text.html if message.text else ""

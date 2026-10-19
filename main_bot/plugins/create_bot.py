@@ -108,7 +108,7 @@ async def handle_creation_input(client: Client, message: Message):
     
     # Global safeguard: enforce text everywhere except when setting a start_pic
     if not message.text:
-        is_pic_step = step == "settings" and state.get("action") == "set_startpic"
+        is_pic_step = step == "settings" and state.get("action") in ("set_startpic", "set_fsubpic")
         if not is_pic_step:
             await message.reply("<b>❌ Please send valid text.</b>")
             return
