@@ -248,6 +248,7 @@ async def handle_auto_delete_input(client: Client, message: Message, state: dict
 
 from worker_bot.fsub_logic import (
     FSUB_DURATION_OPTIONS, revoke_fsub_link, parse_remove_time, fmt_local, tz_label,
+    render_fsub_text, FSUB_TEXT_MAX,
 )
 
 
@@ -328,6 +329,7 @@ async def _show_fsub_menu(query: CallbackQuery, bot_id: int):
             ],
             [InlineKeyboardButton("🔄 Mode (Request / Normal)", callback_data=f"toggle_fsub_{bot_id}")],
             [InlineKeyboardButton("⏳ Auto Remove / Link Rotate", callback_data=f"fsubsch_{bot_id}")],
+            [InlineKeyboardButton("📝 Edit Fsub Text", callback_data=f"fsubtxt_{bot_id}")],
             [InlineKeyboardButton("⏱ Check Duration", callback_data=f"fsubdur_{bot_id}")],
             [InlineKeyboardButton(
                 f"🤖 Auto Check: {'ON ✅' if auto_on else 'OFF ❌'}",
@@ -756,6 +758,103 @@ async def handle_fsub_rename_input(client: Client, message: Message, state: dict
         else f"<b>✅ Button name set to:</b> {text}",
         reply_markup=back,
     )
+
+
+# ---- Editable instruction text above the fsub buttons ----------------------
+
+def _invalidate_fsub_cache(bot_id: int):
+    """Make a running worker pick up a changed setting immediately."""
+    try:
+        from worker_bot.fsub_logic import _MANAGERS
+        mgr = _MANAGERS.get(bot_id)
+        if mgr:
+            mgr.invalidate()
+    except Exception:
+        pass
+
+
+async def _show_fsub_text_menu(query: CallbackQuery, bot_id: int):
+    import html as _html
+    bot = await main_db.get_bot(bot_id)
+    current = ((bot or {}).get("settings", {}) or {}).get("fsub_text", "") or ""
+    shown = (
+        f"<blockquote>{_html.escape(current, quote=False)}</blockquote>"
+        if current else "<i>Default text</i>"
+    )
+    await _safe_edit(
+        query,
+        "<b>📝 Fsub Text</b>\n\n"
+        "<blockquote>This is the instruction users see <b>above the join buttons</b> "
+        "(for example: <i>Join the channels below, then tap Joined</i>).\n"
+        "It is always shown in <b>bold</b>.\n\n"
+        "Placeholders you can use:\n"
+        "<code>{mention}</code> <code>{first}</code> <code>{last}</code> "
+        "<code>{id}</code> <code>{username}</code></blockquote>\n"
+        f"<b>Current:</b>\n{shown}",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Edit Text", callback_data=f"fsubtxte_{bot_id}")],
+            [InlineKeyboardButton("♻️ Reset to Default", callback_data=f"fsubtxtr_{bot_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"fsub_{bot_id}")],
+        ]),
+    )
+
+
+@Client.on_callback_query(filters.regex(r"^fsubtxt_(\d+)$"))
+async def fsub_text_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubtxt_(\d+)$", query.data)
+    if not await _verify_ownership(query, bot_id):
+        return
+    _get_state().pop(query.from_user.id, None)
+    await _show_fsub_text_menu(query, bot_id)
+    await query.answer()
+
+
+@Client.on_callback_query(filters.regex(r"^fsubtxte_(\d+)$"))
+async def fsub_text_edit_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubtxte_(\d+)$", query.data)
+    if not await _verify_ownership(query, bot_id):
+        return
+    _get_state()[query.from_user.id] = {"step": "awaiting_fsub_text", "data": {"bot_id": bot_id}}
+    await query.message.edit_text(
+        "<b>✏️ Send the new fsub text</b>\n\n"
+        f"<blockquote>Max {FSUB_TEXT_MAX} characters. It will be shown in bold.\n\n"
+        "Example:\n<code>Hey {mention}, join the channels below and then tap Joined 👇</code></blockquote>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"fsubtxt_{bot_id}")],
+        ]),
+    )
+    await query.answer()
+
+
+async def handle_fsub_text_input(client: Client, message: Message, state: dict):
+    user_id = message.from_user.id
+    bot_id = state["data"]["bot_id"]
+    text = (message.text or "").strip()
+    back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"fsubtxt_{bot_id}")]])
+    if not text:
+        await message.reply("<b>❌ Send the text as a normal message.</b>")
+        return
+    if len(text) > FSUB_TEXT_MAX:
+        await message.reply(
+            f"<b>❌ Too long ({len(text)} characters).</b> Keep it under {FSUB_TEXT_MAX}."
+        )
+        return
+    await main_db.update_setting(bot_id, "fsub_text", text)
+    _invalidate_fsub_cache(bot_id)
+    _get_state().pop(user_id, None)
+    await message.reply("<b>✅ Fsub text saved!</b>\n\n<b>Preview:</b>")
+    await message.reply(render_fsub_text(text, message.from_user), reply_markup=back)
+
+
+@Client.on_callback_query(filters.regex(r"^fsubtxtr_(\d+)$"))
+async def fsub_text_reset_callback(client: Client, query: CallbackQuery):
+    bot_id = _extract_bot_id(r"^fsubtxtr_(\d+)$", query.data)
+    if not await _verify_ownership(query, bot_id):
+        return
+    await main_db.update_setting(bot_id, "fsub_text", "")
+    _invalidate_fsub_cache(bot_id)
+    await query.answer("♻️ Reset to the default text")
+    await _show_fsub_text_menu(query, bot_id)
 
 
 # ---- Auto remove / request target / link rotation ---------------------------

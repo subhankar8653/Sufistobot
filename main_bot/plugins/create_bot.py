@@ -337,6 +337,10 @@ async def handle_creation_input(client: Client, message: Message):
     # -------------------------------------------------------------------------
     # STEP: Awaiting fsub custom button name (from bot_settings.py)
     # -------------------------------------------------------------------------
+    elif step == "awaiting_fsub_text":
+        from main_bot.plugins.bot_settings import handle_fsub_text_input
+        await handle_fsub_text_input(client, message, state)
+
     elif step == "awaiting_fsub_remove_time":
         from main_bot.plugins.bot_settings import handle_fsub_remove_time_input
         await handle_fsub_remove_time_input(client, message, state)
