@@ -56,6 +56,14 @@ BACKEND_API_SECRET = os.environ.get("BACKEND_API_SECRET", "")
 # Number of Pyrogram workers for the main bot
 TG_BOT_WORKERS = int(os.environ.get("TG_BOT_WORKERS", "8"))
 
+# Concurrent update handlers PER worker bot (asyncio tasks, cheap on RAM).
+# Pyrogram handles at most this many updates at the same time, so this is the
+# real "how many people can I serve in parallel" knob.
+WORKER_BOT_WORKERS = int(os.environ.get("WORKER_BOT_WORKERS", "24"))
+
+# Max messages per second a worker bot sends to users (Telegram allows ~30/s per bot).
+WORKER_SEND_RATE = float(os.environ.get("WORKER_SEND_RATE", "20"))
+
 # Web server port (for health checks / keep-alive)
 PORT = int(os.environ.get("PORT", "8080"))
 

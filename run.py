@@ -96,8 +96,25 @@ async def web_server():
         async def handle(request):
             return web.Response(text="Bot is running!")
             
+        async def health(request):
+            """JSON health: RAM used by this process + running workers (handy on a 1 GB plan)."""
+            import json, os
+            info = {"status": "ok"}
+            try:
+                import psutil
+                info["rss_mb"] = round(psutil.Process(os.getpid()).memory_info().rss / 1048576, 1)
+            except Exception:
+                pass
+            try:
+                from worker_bot.engine import worker_engine
+                info["running_workers"] = len(worker_engine.workers)
+            except Exception:
+                pass
+            return web.Response(text=json.dumps(info), content_type="application/json")
+
         app = web.Application()
         app.router.add_get('/', handle)
+        app.router.add_get('/health', health)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, '0.0.0.0', PORT)
