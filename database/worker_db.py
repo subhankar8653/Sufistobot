@@ -422,7 +422,7 @@ class WorkerDB:
         stats = {}
 
         collections = await db.list_collection_names()
-        source_collections = [c for c in collections if c.startswith(source_prefix)]
+        source_collections = [c for c in collections if c.startswith(source_prefix + "_")]
 
         for src_col_name in source_collections:
             suffix = src_col_name[len(source_prefix):]  # e.g. "_users"
@@ -453,6 +453,6 @@ class WorkerDB:
         prefix = f"bot_{self.bot_id}"
         collections = await db.list_collection_names()
         for col_name in collections:
-            if col_name.startswith(prefix):
+            if col_name.startswith(prefix + "_"):
                 await db.drop_collection(col_name)
                 log.info(f"Dropped collection: {col_name}")

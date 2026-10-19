@@ -72,7 +72,17 @@ class MainDB:
         log_channel_id: int,
     ) -> dict:
         """Register a new user-created bot."""
+        # If this bot is being re-registered, keep its admins and the history of
+        # its older log channels (old links must keep working).
+        prev = await self.bots.find_one({"_id": bot_id})
+        previous_channels = list(prev.get("previous_log_channels", [])) if prev else []
+        if prev and prev.get("log_channel_id") and prev["log_channel_id"] != log_channel_id:
+            if prev["log_channel_id"] not in previous_channels:
+                previous_channels.append(prev["log_channel_id"])
+        previous_channels = [c for c in previous_channels if c != log_channel_id]
         doc = {
+            "admin_ids": list(prev.get("admin_ids", [])) if prev else [],
+            "previous_log_channels": previous_channels,
             "_id": bot_id,
             "owner_id": owner_id,
             "bot_token_encrypted": bot_token_encrypted,
@@ -107,14 +117,58 @@ class MainDB:
         """Get a bot by its encrypted token."""
         return await self.bots.find_one({"bot_token_encrypted": token_encrypted})
 
-    async def get_user_bots(self, owner_id: int) -> list:
-        """Get all active (non-deleted) bots owned by a specific user."""
-        cursor = self.bots.find({"owner_id": owner_id, "is_deleted": {"$ne": True}})
+    # ---- access model -------------------------------------------------------
+    # A user can see/manage a bot if they are its OWNER or one of its ADMINS.
+    # `admin_ids` on the registry doc mirrors the per-bot admins collection so
+    # one query can list every bot a user can access.
+
+    @staticmethod
+    def can_manage(bot: dict, user_id: int) -> bool:
+        """Owner or admin of this bot."""
+        if not bot:
+            return False
+        return bot.get("owner_id") == user_id or user_id in (bot.get("admin_ids") or [])
+
+    @staticmethod
+    def is_owner(bot: dict, user_id: int) -> bool:
+        return bool(bot) and bot.get("owner_id") == user_id
+
+    async def get_user_bots(self, user_id: int) -> list:
+        """ALL active (non-deleted) bots the user owns OR administers."""
+        cursor = self.bots.find({
+            "$or": [{"owner_id": user_id}, {"admin_ids": user_id}],
+            "is_deleted": {"$ne": True},
+        })
         return await cursor.to_list(length=None)
 
-    async def count_user_bots(self, owner_id: int) -> int:
-        """Count active (non-deleted) bots owned by a specific user."""
-        return await self.bots.count_documents({"owner_id": owner_id, "is_deleted": {"$ne": True}})
+    async def count_user_bots(self, user_id: int) -> int:
+        """Universal bot count for the 5-bot limit: owned + administered
+        (so adding a second account as admin can never be used to dodge the limit)."""
+        return await self.bots.count_documents({
+            "$or": [{"owner_id": user_id}, {"admin_ids": user_id}],
+            "is_deleted": {"$ne": True},
+        })
+
+    async def add_bot_admin(self, bot_id: int, admin_id: int):
+        await self.bots.update_one({"_id": bot_id}, {"$addToSet": {"admin_ids": int(admin_id)}})
+
+    async def remove_bot_admin(self, bot_id: int, admin_id: int):
+        await self.bots.update_one({"_id": bot_id}, {"$pull": {"admin_ids": int(admin_id)}})
+
+    async def sync_bot_admins(self, bot_id: int):
+        """Rebuild admin_ids of one bot from its per-bot admins collection."""
+        db = get_db()
+        docs = await db[f"bot_{bot_id}_admins"].find().to_list(length=None)
+        ids = [d["_id"] for d in docs if isinstance(d.get("_id"), int)]
+        await self.bots.update_one({"_id": bot_id}, {"$set": {"admin_ids": ids}})
+
+    async def sync_admin_ids(self):
+        """Startup backfill: make sure every bot's admin_ids matches reality."""
+        try:
+            async for bot in self.bots.find({}, {"_id": 1}):
+                await self.sync_bot_admins(bot["_id"])
+        except Exception as e:
+            log.error(f"sync_admin_ids failed: {e}")
 
     async def get_deleted_user_bots(self, owner_id: int) -> list:
         """Get all soft-deleted bots owned by a user (for data transfer)."""
@@ -153,11 +207,29 @@ class MainDB:
         )
 
     async def update_log_channel(self, bot_id: int, channel_id: int):
-        """Update a bot's log channel."""
-        await self.bots.update_one(
-            {"_id": bot_id},
-            {"$set": {"log_channel_id": channel_id}},
-        )
+        """Change a bot's log channel. The OLD channel id is remembered, because
+        every file link encodes (message_id x channel_id) and old links must keep
+        resolving against the channel they were created for."""
+        doc = await self.bots.find_one({"_id": bot_id})
+        old = doc.get("log_channel_id") if doc else None
+        await self.bots.update_one({"_id": bot_id}, {"$set": {"log_channel_id": channel_id}})
+        await self.bots.update_one({"_id": bot_id}, {"$pull": {"previous_log_channels": channel_id}})
+        if old and old != channel_id:
+            await self.bots.update_one({"_id": bot_id}, {"$addToSet": {"previous_log_channels": old}})
+
+    async def add_old_log_channels(self, bot_id: int, channel_ids: list):
+        """Register older log channels so links made for them still work."""
+        doc = await self.bots.find_one({"_id": bot_id})
+        cur = doc.get("log_channel_id") if doc else None
+        ids = [int(c) for c in channel_ids if c and int(c) != cur]
+        if ids:
+            await self.bots.update_one(
+                {"_id": bot_id}, {"$addToSet": {"previous_log_channels": {"$each": ids}}}
+            )
+
+    async def get_old_log_channels(self, bot_id: int) -> list:
+        doc = await self.bots.find_one({"_id": bot_id})
+        return list(doc.get("previous_log_channels", [])) if doc else []
 
     async def update_last_active(self, bot_id: int):
         """Update the last_active timestamp of a bot."""
