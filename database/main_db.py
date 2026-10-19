@@ -20,6 +20,28 @@ class MainDB:
         self.bots = db["registered_bots"]
         self.users = db["main_users"]
         self.cooldowns = db["creation_cooldowns"]
+        self.main_admins = db["main_admins"]       # people the OWNER approved to use the main bot
+
+    # =========================================================================
+    # MAIN-BOT ACCESS (owner-approved admins)
+    # =========================================================================
+
+    async def add_main_admin(self, user_id: int, added_by: int) -> bool:
+        """Approve a user to use the main bot. Returns True if newly added."""
+        if await self.main_admins.find_one({"_id": user_id}):
+            return False
+        await self.main_admins.insert_one({
+            "_id": user_id, "added_by": added_by, "added_at": datetime.now(timezone.utc),
+        })
+        return True
+
+    async def remove_main_admin(self, user_id: int) -> bool:
+        res = await self.main_admins.delete_one({"_id": user_id})
+        return res.deleted_count > 0
+
+    async def list_main_admins(self) -> list:
+        docs = await self.main_admins.find().to_list(length=None)
+        return [d["_id"] for d in docs]
 
     # =========================================================================
     # USER MANAGEMENT
