@@ -353,6 +353,9 @@ class FsubManager:
     async def _auto_check(self) -> bool:
         return await self._sf.get("auto", self.db.get_auto_check, ttl=DOCS_TTL)
 
+    async def _layout(self) -> int:
+        return await self._sf.get("layout", self.db.get_fsub_layout, ttl=DOCS_TTL)
+
     async def _duration_cfg(self) -> dict:
         return await self._sf.get("dur", self.db.get_fsub_check_duration, ttl=DOCS_TTL)
 
@@ -549,7 +552,8 @@ class FsubManager:
     # buttons / captions
     # ------------------------------------------------------------------
 
-    async def _channel_button(self, client: Client, cid: int, position: int, stepwise: bool = False):
+    async def _channel_button(self, client: Client, cid: int, position: int, stepwise: bool = False,
+                              compact: bool = False):
         try:
             mode = await self._mode(cid)
             link = await self._channel_link(client, cid, mode)
@@ -557,7 +561,11 @@ class FsubManager:
                 return None
             custom = await self._name(cid)
             label = "Request" if mode == "on" else "Join"
-            if stepwise:
+            if compact:
+                # 2-per-row layout: short "Req" so the text fits in a half-width button
+                short = "Req" if mode == "on" else "Join"
+                text = custom if custom else f"⚡ {short} Channel {position} ⚡"
+            elif stepwise:
                 text = f"🔴 {custom}" if custom else f"🔴 {label} channel {position:02d}"
             else:
                 text = custom if custom else f"⚡ {label} channel {position:02d} ⚡"
@@ -585,12 +593,18 @@ class FsubManager:
             if not joined:
                 pending.append(cid)  # joined / request-sent channels stay hidden
 
-        built = await asyncio.gather(*[self._channel_button(client, cid, position_map[cid]) for cid in pending])
-        count = 0
-        for btn in built:
-            if btn:
+        two_per_row = (await self._layout()) == 2
+        built = await asyncio.gather(*[
+            self._channel_button(client, cid, position_map[cid], compact=two_per_row) for cid in pending
+        ])
+        ok = [b for b in built if b]
+        count = len(ok)
+        if two_per_row:
+            for i in range(0, len(ok), 2):
+                buttons.append(ok[i:i + 2])     # last odd button stays alone (full width)
+        else:
+            for btn in ok:
                 buttons.append([btn])
-                count += 1
 
         if count == 0:
             return None
