@@ -66,10 +66,25 @@ TG_BOT_WORKERS = int(os.environ.get("TG_BOT_WORKERS", "8"))
 # Concurrent update handlers PER worker bot (asyncio tasks, cheap on RAM).
 # Pyrogram handles at most this many updates at the same time, so this is the
 # real "how many people can I serve in parallel" knob.
-WORKER_BOT_WORKERS = int(os.environ.get("WORKER_BOT_WORKERS", "24"))
+WORKER_BOT_WORKERS = int(os.environ.get("WORKER_BOT_WORKERS", "64"))
 
 # Max messages per second a worker bot sends to users (Telegram allows ~30/s per bot).
 WORKER_SEND_RATE = float(os.environ.get("WORKER_SEND_RATE", "20"))
+
+# ---- Overload protection (traffic control) ----------------------------------
+# Max /start requests a worker bot processes at the SAME time. When this many are
+# already in progress, new /start requests are skipped (the first ones are served,
+# later ones are not counted) until the load drops to ~70% — then everyone is
+# served again. Keep it below WORKER_BOT_WORKERS so buttons/admin still respond.
+WORKER_MAX_ACTIVE_START = int(os.environ.get("WORKER_MAX_ACTIVE_START", "40"))
+# A single /start that takes longer than this (seconds) is cancelled so it can't hog a slot.
+WORKER_START_TIMEOUT = int(os.environ.get("WORKER_START_TIMEOUT", "180"))
+# /start messages older than this (seconds) are ignored (e.g. a backlog after downtime). 0 = off.
+WORKER_STALE_START_SECS = int(os.environ.get("WORKER_STALE_START_SECS", "180"))
+# Watchdog: how often (seconds) every worker is health-checked and auto-restarted if dead.
+WATCHDOG_INTERVAL = int(os.environ.get("WATCHDOG_INTERVAL", "20"))
+# Pending-update queue size above which a non-draining queue counts as "stuck".
+WATCHDOG_QUEUE_LIMIT = int(os.environ.get("WATCHDOG_QUEUE_LIMIT", "150"))
 
 # Web server port (for health checks / keep-alive)
 PORT = int(os.environ.get("PORT", "8080"))

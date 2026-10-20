@@ -108,6 +108,7 @@ async def web_server():
             try:
                 from worker_bot.engine import worker_engine
                 info["running_workers"] = len(worker_engine.workers)
+                info["bots"] = worker_engine.snapshot()
             except Exception:
                 pass
             return web.Response(text=json.dumps(info), content_type="application/json")
