@@ -15,7 +15,11 @@ from pyrogram.types import (
 )
 #@suhanibots
 from pyrogram.errors import FloodWait
-from config import API_ID, API_HASH, LOGGER, OWNER_ID, WORKER_BOT_WORKERS, WORKER_SEND_RATE
+from config import (
+    API_ID, API_HASH, LOGGER, OWNER_ID, WORKER_BOT_WORKERS, WORKER_SEND_RATE,
+    WORKER_MAX_ACTIVE_START, WORKER_START_TIMEOUT, WORKER_STALE_START_SECS,
+    WATCHDOG_INTERVAL, WATCHDOG_QUEUE_LIMIT,
+)
 from database.main_db import MainDB
 from database.worker_db import WorkerDB
 from worker_bot.scale import RateLimiter, SingleFlightCache, LogBatcher
@@ -37,6 +41,150 @@ class WorkerEngine:
     def __init__(self):
         self.workers: dict[int, Client] = {}  # bot_id -> Client
         self._lock = asyncio.Lock()
+        # Bots that SHOULD be running (started and not stopped on purpose). The watchdog
+        # revives any of them that died / hung. stop_worker() removes a bot from here.
+        self.desired: dict[int, dict] = {}
+        self._restarting: set = set()
+        self._retry_at: dict[int, float] = {}
+        self._retry_fails: dict[int, int] = {}
+        self._notified: dict = {}
+        self._watchdog_task = None
+
+    # =========================================================================
+    # WATCHDOG — brings dead / hung workers back automatically
+    # =========================================================================
+
+    def _ensure_watchdog(self):
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def _notify(self, bot_doc: dict, text: str, key: str, every: float = 600.0):
+        """Tell the bot owner + super owner (throttled, never raises)."""
+        now = time.monotonic()
+        if now - self._notified.get(key, -1e9) < every:
+            return
+        self._notified[key] = now
+        try:
+            import utils.helpers as _h
+            mb = getattr(_h, "main_bot_client", None)
+            if mb is None:
+                return
+            targets = {OWNER_ID}
+            if bot_doc and bot_doc.get("owner_id"):
+                targets.add(bot_doc["owner_id"])
+            for t in targets:
+                if t:
+                    try:
+                        await mb.send_message(t, text)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    async def _diagnose(self, bot_id: int, app: Client, st: dict):
+        """Return a reason string if the worker is dead/hung, else None."""
+        if not getattr(app, "is_connected", True):
+            return "disconnected from Telegram"
+
+        # 1) update queue not draining -> every handler slot is stuck
+        try:
+            q = app.dispatcher.updates_queue.qsize()
+        except Exception:
+            q = 0
+        if q > WATCHDOG_QUEUE_LIMIT and q >= st.get("last_q", 0):
+            st["stall"] = st.get("stall", 0) + 1
+        else:
+            st["stall"] = 0
+        st["last_q"] = q
+        if st["stall"] >= 4:
+            return f"update queue stuck ({q} waiting)"
+
+        # 2) Telegram does not answer a simple call
+        try:
+            await asyncio.wait_for(app.get_me(), timeout=12)
+            st["probe_fail"] = 0
+        except Exception as e:
+            st["probe_fail"] = st.get("probe_fail", 0) + 1
+            if st["probe_fail"] >= 3:
+                return f"no response from Telegram ({type(e).__name__})"
+        return None
+
+    async def _revive(self, bot_id: int, reason: str):
+        if bot_id in self._restarting:
+            return
+        self._restarting.add(bot_id)
+        try:
+            log.warning(f"[watchdog] restarting bot {bot_id}: {reason}")
+            await self.stop_worker(bot_id, keep_desired=True)
+            await asyncio.sleep(1)
+            doc = await main_db.get_bot(bot_id)
+            if not doc or doc.get("is_deleted") or not doc.get("is_active", True):
+                self.desired.pop(bot_id, None)       # owner stopped / deleted it meanwhile
+                return
+            try:
+                await self.start_worker(doc)
+                self._retry_fails.pop(bot_id, None)
+                self._retry_at.pop(bot_id, None)
+                log.info(f"[watchdog] bot {bot_id} is back online")
+                await self._notify(
+                    doc,
+                    f"<b>♻️ Bot auto-restarted</b>\n\n<blockquote>@{doc.get('bot_username', bot_id)} "
+                    f"stopped responding ({reason}) and was restarted automatically.</blockquote>",
+                    key=f"restart:{bot_id}",
+                )
+            except Exception as e:
+                n = self._retry_fails.get(bot_id, 0) + 1
+                self._retry_fails[bot_id] = n
+                delay = min(300, 15 * (2 ** (n - 1)))
+                self._retry_at[bot_id] = time.monotonic() + delay
+                log.error(f"[watchdog] restart of {bot_id} failed ({e}); retry in {delay}s")
+        finally:
+            self._restarting.discard(bot_id)
+
+    async def _watch_one(self, bot_id: int, states: dict):
+        if bot_id in self._restarting:
+            return
+        app = self.workers.get(bot_id)
+        if app is None:
+            if time.monotonic() >= self._retry_at.get(bot_id, 0):
+                await self._revive(bot_id, "worker was not running")
+            return
+        reason = await self._diagnose(bot_id, app, states.setdefault(bot_id, {}))
+        if reason:
+            states.pop(bot_id, None)
+            await self._revive(bot_id, reason)
+
+    async def _watchdog_loop(self):
+        states: dict = {}
+        await asyncio.sleep(30)
+        while True:
+            try:
+                ids = list(self.desired)
+                for gone in [b for b in states if b not in self.desired]:
+                    states.pop(gone, None)
+                if ids:
+                    await asyncio.gather(*[self._watch_one(b, states) for b in ids], return_exceptions=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error(f"[watchdog] loop error: {e}")
+            await asyncio.sleep(WATCHDOG_INTERVAL)
+
+    def snapshot(self) -> dict:
+        """Per-bot traffic stats for /health."""
+        out = {}
+        for bot_id, app in self.workers.items():
+            h = getattr(app, "_health", None) or {}
+            try:
+                q = app.dispatcher.updates_queue.qsize()
+            except Exception:
+                q = None
+            out[str(bot_id)] = {
+                "active_start": h.get("active", 0), "shedding": h.get("shedding", False),
+                "served": h.get("served", 0), "skipped_overload": h.get("dropped", 0),
+                "skipped_stale": h.get("stale", 0), "queue": q,
+            }
+        return out
 
     async def start_all_workers(self):
         """Start all active bots from the database."""
@@ -67,6 +215,8 @@ class WorkerEngine:
     async def start_worker(self, bot_doc: dict):
         """Start a single worker bot."""
         bot_id = bot_doc["_id"]
+        self.desired[bot_id] = bot_doc        # the watchdog keeps this bot alive
+        self._ensure_watchdog()
 
         async with self._lock:
             if bot_id in self.workers:
@@ -77,6 +227,7 @@ class WorkerEngine:
             token = decrypt_token(bot_doc["bot_token_encrypted"])
         except Exception as e:
             log.error(f"Cannot decrypt token for bot {bot_id}: {e}")
+            self.desired.pop(bot_id, None)    # retrying can never fix a bad token
             raise RuntimeError(f"Cannot decrypt bot token: {e}")
 
         log_channel_id = bot_doc["log_channel_id"]
@@ -118,6 +269,24 @@ class WorkerEngine:
                     log.error(f"bot doc refresh failed: {e}")
                 _doc_cache["t"] = time.monotonic()
             return _doc_cache["doc"]
+
+        # ---- traffic control state (see worker_start below) ----
+        health = {"active": 0, "shedding": False, "served": 0, "dropped": 0, "stale": 0,
+                  "inflight_users": set(), "notice_sec": 0, "notice_n": 0}
+        app._health = health
+        known_users: set = set()          # users already in the DB -> no Mongo read on repeat /start
+        ban_cache: dict = {}              # uid -> (monotonic time, banned?)
+
+        async def is_banned(uid: int) -> bool:
+            hit = ban_cache.get(uid)
+            now = time.monotonic()
+            if hit and now - hit[0] < 20:
+                return hit[1]
+            val = await worker_db.ban_user_exist(uid)
+            if len(ban_cache) > 50000:
+                ban_cache.clear()
+            ban_cache[uid] = (now, val)
+            return val
 
         # Global middleware to update last_active (at most once a minute, not once per update)
         _last_active = [0.0]
@@ -165,27 +334,30 @@ class WorkerEngine:
         # HANDLER: /start
         # =====================================================================
 
-        @app.on_message(filters.command("start") & filters.private)
-        async def worker_start(client: Client, message: Message):
+        async def worker_start_impl(client: Client, message: Message):
             user_id = message.from_user.id
             current_bot_doc = await get_current_doc()
 
-            # Track user
-            if not await worker_db.present_user(user_id):
-                await worker_db.add_user(user_id)
-                
-                if log_channel_id:
-                    # queued + batched: never blocks the user and never trips the
-                    # channel's ~20 messages/minute limit when many new users arrive
-                    new_user_log.add(
-                        f"<b>#NewUser</b>\n\n"
-                        f"<b>Iᴅ</b> - <code>{user_id}</code>\n"
-                        f"<b>Nᴀᴍᴇ</b> - {message.from_user.first_name}\n"
-                        f"<b>username</b> - @{message.from_user.username or 'N/A'}"
-                    )
+            # Track user (known users are remembered in memory: no DB read per /start)
+            if user_id not in known_users:
+                if not await worker_db.present_user(user_id):
+                    await worker_db.add_user(user_id)
+
+                    if log_channel_id:
+                        # queued + batched: never blocks the user and never trips the
+                        # channel's ~20 messages/minute limit when many new users arrive
+                        new_user_log.add(
+                            f"<b>#NewUser</b>\n\n"
+                            f"<b>Iᴅ</b> - <code>{user_id}</code>\n"
+                            f"<b>Nᴀᴍᴇ</b> - {message.from_user.first_name}\n"
+                            f"<b>username</b> - @{message.from_user.username or 'N/A'}"
+                        )
+                if len(known_users) > 200000:
+                    known_users.clear()
+                known_users.add(user_id)
 
             # Check ban
-            if await worker_db.ban_user_exist(user_id):
+            if await is_banned(user_id):
                 await message.reply(
                     "<b>━━━━━━━━━━━━━━━━━━━━━\n"
                     "⛔ 𝗔𝗖𝗖𝗘𝗦𝗦 𝗗𝗘𝗡𝗜𝗘𝗗\n"
@@ -195,7 +367,7 @@ class WorkerEngine:
                 return
 
             # Check force-sub (shows the fsub screen itself when needed)
-            if not await fsub.gate(client, message, worker_start):
+            if not await fsub.gate(client, message, worker_start_impl):
                 return
 
             # Handle /start verify — mark user as verified via shortener
@@ -466,6 +638,79 @@ class WorkerEngine:
         # HANDLER: /ban & /unban (admin only)
         # =====================================================================
 
+        # ---------------------------------------------------------------------
+        # TRAFFIC CONTROL for /start
+        #  * at most WORKER_MAX_ACTIVE_START users are processed at the same time
+        #  * when that is reached the bot "sheds load": NEW /start requests are skipped
+        #    (the ones already being served finish normally) until the load falls to
+        #    ~70% — then everybody is served again
+        #  * a double /start from the same user and old backlog /starts are ignored
+        #  * one stuck /start can never hold a slot longer than WORKER_START_TIMEOUT
+        # ---------------------------------------------------------------------
+        async def _busy_notice(message: Message):
+            now_s = int(time.time())
+            if health["notice_sec"] != now_s:
+                health["notice_sec"], health["notice_n"] = now_s, 0
+            if health["notice_n"] >= 3:          # never spend API calls on a flood of notices
+                return
+            health["notice_n"] += 1
+            try:
+                await asyncio.wait_for(message.reply(
+                    "<b>⏳ ᴛᴏᴏ ᴍᴀɴʏ ᴜsᴇʀs ʀɪɢʜᴛ ɴᴏᴡ.</b>\n\n"
+                    "<blockquote>ᴘʟᴇᴀsᴇ sᴇɴᴅ /start ᴀɢᴀɪɴ ɪɴ ᴀ ꜰᴇᴡ sᴇᴄᴏɴᴅs.</blockquote>"
+                ), timeout=5)
+            except Exception:
+                pass
+
+        @app.on_message(filters.command("start") & filters.private)
+        async def worker_start(client: Client, message: Message):
+            if message.from_user is None:
+                return
+            user_id = message.from_user.id
+            privileged = user_id == owner_id or user_id == OWNER_ID
+            limit = max(1, WORKER_MAX_ACTIVE_START)
+
+            if not privileged:
+                if WORKER_STALE_START_SECS:
+                    try:
+                        if time.time() - message.date.timestamp() > WORKER_STALE_START_SECS:
+                            health["stale"] += 1
+                            return
+                    except Exception:
+                        pass
+                if user_id in health["inflight_users"]:
+                    return                                  # already being served
+                if health["shedding"] and health["active"] <= int(limit * 0.7):
+                    health["shedding"] = False
+                    log.info(f"[traffic] bot {bot_id}: load normal again, accepting all /start")
+                if not health["shedding"] and health["active"] >= limit:
+                    health["shedding"] = True
+                    log.warning(f"[traffic] bot {bot_id}: OVERLOAD ({health['active']} active) — skipping new /start")
+                    asyncio.create_task(self._notify(
+                        await get_current_doc(),
+                        f"<b>⚠️ High traffic</b>\n\n<blockquote>@{bot_username} is getting a huge burst of users. "
+                        f"New /start requests are skipped for a moment so the bot stays alive; "
+                        f"normal service resumes automatically.</blockquote>",
+                        key=f"overload:{bot_id}", every=900,
+                    ))
+                if health["shedding"]:
+                    health["dropped"] += 1
+                    await _busy_notice(message)
+                    return
+
+            health["active"] += 1
+            health["inflight_users"].add(user_id)
+            try:
+                await asyncio.wait_for(worker_start_impl(client, message), timeout=WORKER_START_TIMEOUT)
+            except asyncio.TimeoutError:
+                log.error(f"/start of {user_id} timed out after {WORKER_START_TIMEOUT}s (bot {bot_id})")
+            except Exception as e:
+                log.error(f"/start handler error (bot {bot_id}, user {user_id}): {e}", exc_info=True)
+            finally:
+                health["active"] -= 1
+                health["inflight_users"].discard(user_id)
+                health["served"] += 1
+
         @app.on_message(filters.command("oldchannel") & filters.private)
         async def handle_oldchannel(client: Client, message: Message):
             """/oldchannel <id>  — make links created for an OLDER log channel work again.
@@ -506,6 +751,7 @@ class WorkerEngine:
             try:
                 target_id = int(message.command[1])
                 await worker_db.add_ban_user(target_id)
+                ban_cache.pop(target_id, None)
                 await message.reply(f"<b>✅ User {target_id} has been banned from this bot!</b>")
             except ValueError:
                 await message.reply("<b>❌ Invalid User ID.</b>")
@@ -520,6 +766,7 @@ class WorkerEngine:
             try:
                 target_id = int(message.command[1])
                 await worker_db.del_ban_user(target_id)
+                ban_cache.pop(target_id, None)
                 await message.reply(f"<b>✅ User {target_id} has been unbanned from this bot!</b>")
             except ValueError:
                 await message.reply("<b>❌ Invalid User ID.</b>")
@@ -628,21 +875,24 @@ class WorkerEngine:
             app._bg_stoppers = [new_user_log.stop]
 
             # Set bot commands in the Telegram menu
-            from pyrogram.types import BotCommand
-            await app.set_bot_commands([
-                BotCommand("start", "Start the bot / Retrieve files"),
-                BotCommand("genlink", "Generate link for a single post"),
-                BotCommand("batch", "Generate link for multiple posts"),
-                BotCommand("custom_batch", "Generate link for custom posts"),
-                BotCommand("flink", "Formatted links generator"),
-                BotCommand("broadcast", "Broadcast a message (Admin)"),
-                BotCommand("auto_check", "Fsub step-by-step mode on/off (Admin)"),
-                BotCommand("setfakelink", "Add a fake fsub button (Admin)"),
-                BotCommand("listfakelink", "List fake fsub buttons (Admin)"),
-                BotCommand("deletefakelink", "Delete a fake fsub button (Admin)"),
-                BotCommand("set_tutorial_fsub", "Set fsub tutorial video (Admin)"),
-                BotCommand("fsub_tutorial", "Fsub tutorial on/off (Admin)"),
-            ])
+            try:
+                from pyrogram.types import BotCommand
+                await app.set_bot_commands([
+                    BotCommand("start", "Start the bot / Retrieve files"),
+                    BotCommand("genlink", "Generate link for a single post"),
+                    BotCommand("batch", "Generate link for multiple posts"),
+                    BotCommand("custom_batch", "Generate link for custom posts"),
+                    BotCommand("flink", "Formatted links generator"),
+                    BotCommand("broadcast", "Broadcast a message (Admin)"),
+                    BotCommand("auto_check", "Fsub step-by-step mode on/off (Admin)"),
+                    BotCommand("setfakelink", "Add a fake fsub button (Admin)"),
+                    BotCommand("listfakelink", "List fake fsub buttons (Admin)"),
+                    BotCommand("deletefakelink", "Delete a fake fsub button (Admin)"),
+                    BotCommand("set_tutorial_fsub", "Set fsub tutorial video (Admin)"),
+                    BotCommand("fsub_tutorial", "Fsub tutorial on/off (Admin)"),
+                ])
+            except Exception as _cmd_err:
+                log.warning(f"set_bot_commands failed for {bot_id}: {_cmd_err}")
 
             me = await app.get_me()
             log.info(f"Worker started: @{me.username} (ID: {bot_id})")
@@ -660,10 +910,19 @@ class WorkerEngine:
                     t.cancel()
             except Exception:
                 pass
+            try:
+                await asyncio.wait_for(app.stop(block=False), timeout=5.0)   # don't leak a half-started client
+            except Exception:
+                pass
             raise
 
-    async def stop_worker(self, bot_id: int):
-        """Stop a single worker bot."""
+    async def stop_worker(self, bot_id: int, keep_desired: bool = False):
+        """Stop a single worker bot. (keep_desired=True: used by the watchdog restart —
+        the bot is meant to come back. Normal stops mean 'do not revive'.)"""
+        if not keep_desired:
+            self.desired.pop(bot_id, None)
+            self._retry_at.pop(bot_id, None)
+            self._retry_fails.pop(bot_id, None)
         async with self._lock:
             app = self.workers.pop(bot_id, None)
 
@@ -687,6 +946,9 @@ class WorkerEngine:
 
     async def stop_all_workers(self):
         """Stop all running worker bots."""
+        self.desired.clear()
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
         async with self._lock:
             bot_ids = list(self.workers.keys())
 
