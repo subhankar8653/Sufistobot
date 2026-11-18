@@ -119,7 +119,7 @@ async def handle_creation_input(client: Client, message: Message):
     # Global safeguard: enforce text everywhere except when setting a start_pic
     if not message.text:
         is_pic_step = step == "settings" and state.get("action") in ("set_startpic", "set_fsubpic")
-        if not is_pic_step:
+        if not is_pic_step and step != "awaiting_main_admin":
             await message.reply("<b>❌ Please send valid text.</b>")
             return
 
@@ -377,6 +377,10 @@ async def handle_creation_input(client: Client, message: Message):
     # -------------------------------------------------------------------------
     # STEP: Awaiting admin ID (from bot_settings.py)
     # -------------------------------------------------------------------------
+    elif step == "awaiting_main_admin":
+        from main_bot.plugins.admin_panel import handle_main_admin_input
+        await handle_main_admin_input(client, message, state)
+
     elif step == "awaiting_admin_id":
         from main_bot.plugins.bot_settings import handle_admin_input
         await handle_admin_input(client, message, state)

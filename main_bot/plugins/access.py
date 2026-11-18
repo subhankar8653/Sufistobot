@@ -16,6 +16,7 @@ Owner commands (in the main bot):
     /adminlist
 """
 
+import re
 import time
 
 from pyrogram import Client, filters
@@ -111,24 +112,51 @@ async def _gate_inline(client: Client, query: InlineQuery):
 # OWNER COMMANDS
 # =============================================================================
 
-def _target_id(message: Message):
-    """User id from '/cmd 123456' or from the replied-to message."""
-    if len(message.command) > 1:
-        raw = message.command[1].strip()
+def _forwarded_user_id(msg):
+    if msg is None:
+        return None
+    origin = getattr(msg, "forward_origin", None)
+    u = getattr(origin, "sender_user", None) if origin is not None else None
+    if u is None:
+        u = getattr(msg, "forward_from", None)
+    return u.id if u is not None else None
+
+
+async def resolve_user_id(client: Client, message: Message, text: str = None):
+    """User id from: '/cmd 123', '/cmd @username', plain text '123' / '@username',
+    a forwarded message, or a reply to the person's message. None if not possible."""
+    raw = text
+    if raw is None and message.command and len(message.command) > 1:
+        raw = message.command[1]
+    raw = (raw or "").strip()
+    if raw:
         if raw.lstrip("-").isdigit():
             return int(raw)
+        if re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{4,31}", raw):
+            try:
+                return (await client.get_users(raw.lstrip("@"))).id
+            except Exception:
+                return None
         return None
-    if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id
+    fwd = _forwarded_user_id(message)
+    if fwd:
+        return fwd
+    reply = message.reply_to_message
+    if reply is not None:
+        fwd = _forwarded_user_id(reply)
+        if fwd:
+            return fwd
+        if reply.from_user is not None and not reply.from_user.is_bot:
+            return reply.from_user.id
     return None
 
 
 @Client.on_message(filters.command("addadmin") & filters.private & filters.user(OWNER_ID))
 async def add_admin_cmd(client: Client, message: Message):
-    target = _target_id(message)
+    target = await resolve_user_id(client, message)
     if not target:
         await message.reply(
-            "<b>Usage:</b> <code>/addadmin 123456789</code>\n"
+            "<b>Usage:</b> <code>/addadmin 123456789</code> or <code>/addadmin @username</code>\n"
             "<i>or reply to that person's message with /addadmin</i>"
         )
         return
@@ -154,9 +182,9 @@ async def add_admin_cmd(client: Client, message: Message):
 
 @Client.on_message(filters.command("deladmin") & filters.private & filters.user(OWNER_ID))
 async def del_admin_cmd(client: Client, message: Message):
-    target = _target_id(message)
+    target = await resolve_user_id(client, message)
     if not target:
-        await message.reply("<b>Usage:</b> <code>/deladmin 123456789</code>")
+        await message.reply("<b>Usage:</b> <code>/deladmin 123456789</code> (or @username)")
         return
     if target == OWNER_ID:
         await message.reply("<b>❌ The owner can't be removed.</b>")

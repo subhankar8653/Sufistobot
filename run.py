@@ -172,6 +172,19 @@ async def main():
             BotCommand("start", "Start the controller / Main menu"),
         ])
 
+        try:   # extra commands only the OWNER sees in the menu
+            from pyrogram.types import BotCommandScopeChat
+            await main_bot.set_bot_commands(
+                [
+                    BotCommand("start", "Start the controller / Main menu"),
+                    BotCommand("admin", "Admin panel: add / remove admins"),
+                    BotCommand("adminlist", "List approved admins"),
+                ],
+                scope=BotCommandScopeChat(chat_id=OWNER_ID),
+            )
+        except Exception as _e:
+            log.warning(f"owner command menu not set: {_e}")
+
         me = await main_bot.get_me()
         log.info(f"Main bot started: @{me.username}")
 

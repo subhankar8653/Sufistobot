@@ -392,11 +392,8 @@ class WorkerEngine:
                 return
 
             # Check for deep link (file retrieval)
-            if len(text) > 7:
-                try:
-                    base64_string = text.split(" ", 1)[1]
-                except IndexError:
-                    return
+            if len(message.command) > 1:
+                base64_string = message.command[1]
 
                 _bad_link = (
                     "<b>━━━━━━━━━━━━━━━━━━━━━\n"
@@ -614,13 +611,16 @@ class WorkerEngine:
                 start_pic = settings.get("start_pic", "")
                 start_message = settings.get("start_message", "")
 
+                from utils.start_text import looks_like_fsub_notice, default_welcome
+                if start_message and looks_like_fsub_notice(start_message):
+                    # leftover "you haven't joined all channels" text saved as start message:
+                    # the user already passed force-sub, so show the normal welcome instead
+                    start_message = ""
+                    start_pic = ""
+
                 if not start_message:
-                    start_message = (
-                        f"<blockquote>ᴡᴇʟᴄᴏᴍᴇ {message.from_user.mention}!\n\n"
-                        f"ɪ ᴄᴀɴ sᴛᴏʀᴇ ꜰɪʟᴇs ᴀɴᴅ sʜᴀʀᴇ ᴛʜᴇᴍ\n"
-                        f"ᴠɪᴀ sᴘᴇᴄɪᴀʟ ʟɪɴᴋs.\n\n"
-                        f"ᴘᴏᴡᴇʀᴇᴅ ʙʏ @suhanibots</blockquote>"
-                    )
+                    _me = await client.get_me()
+                    start_message = default_welcome(message.from_user.mention, _me.username)
                 else:
                     try:
                         me = await client.get_me()
@@ -717,6 +717,16 @@ class WorkerEngine:
                 health["active"] -= 1
                 health["inflight_users"].discard(user_id)
                 health["served"] += 1
+
+        @app.on_message(filters.command("help") & filters.private)
+        async def handle_help(client: Client, message: Message):
+            if message.from_user is None:
+                return
+            from utils.start_text import HELP_USER, HELP_ADMIN_EXTRA
+            text = HELP_USER
+            if await is_admin(message.from_user.id):
+                text += HELP_ADMIN_EXTRA
+            await message.reply(text)
 
         @app.on_message(filters.command("oldchannel") & filters.private)
         async def handle_oldchannel(client: Client, message: Message):
@@ -886,6 +896,7 @@ class WorkerEngine:
                 from pyrogram.types import BotCommand
                 await app.set_bot_commands([
                     BotCommand("start", "Start the bot / Retrieve files"),
+                    BotCommand("help", "How to use this bot"),
                     BotCommand("genlink", "Generate link for a single post"),
                     BotCommand("batch", "Generate link for multiple posts"),
                     BotCommand("custom_batch", "Generate link for custom posts"),
