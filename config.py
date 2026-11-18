@@ -86,7 +86,7 @@ WORKER_SEND_RATE = float(os.environ.get("WORKER_SEND_RATE", "20"))
 # served again. Keep it below WORKER_BOT_WORKERS so buttons/admin still respond.
 WORKER_MAX_ACTIVE_START = int(os.environ.get("WORKER_MAX_ACTIVE_START", "40"))
 # A single /start that takes longer than this (seconds) is cancelled so it can't hog a slot.
-WORKER_START_TIMEOUT = int(os.environ.get("WORKER_START_TIMEOUT", "180"))
+WORKER_START_TIMEOUT = int(os.environ.get("WORKER_START_TIMEOUT", "900"))
 # /start messages older than this (seconds) are ignored (e.g. a backlog after downtime). 0 = off.
 WORKER_STALE_START_SECS = int(os.environ.get("WORKER_STALE_START_SECS", "180"))
 # Watchdog: how often (seconds) every worker is health-checked and auto-restarted if dead.

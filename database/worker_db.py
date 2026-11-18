@@ -1,5 +1,9 @@
 #@suhanibots
 
+from datetime import datetime
+
+from pymongo.errors import DuplicateKeyError
+
 from database.mongo import get_db
 from config import LOGGER
 
@@ -30,6 +34,7 @@ class WorkerDB:
         self.fake_links = db[f"{prefix}_fake_links"]      # fake (extra) buttons shown on fsub screen
         self.tutorials = db[f"{prefix}_tutorials"]        # fsub tutorial video
         self.pending_del = db[f"{prefix}_pending_del"]    # auto-delete queue (survives restarts)
+        self.dedupe = db[f"{prefix}_dedupe"]              # exactly-once guard for /start (TTL 15 min)
 
     # =========================================================================
     # USER TRACKING
@@ -264,7 +269,23 @@ class WorkerDB:
     # AUTO-DELETE QUEUE (persistent: survives restarts / hibernation)
     # =========================================================================
 
+    async def claim_update(self, key: str) -> bool:
+        """True if THIS process is the first to claim `key` (e.g. one /start message).
+        False if another copy of the bot already claimed it. DB trouble -> True (never block users)."""
+        try:
+            await self.dedupe.insert_one({"_id": key, "t": datetime.utcnow()})
+            return True
+        except DuplicateKeyError:
+            return False
+        except Exception as e:
+            log.error(f"claim_update failed (allowing): {e}")
+            return True
+
     async def ensure_indexes(self):
+        try:
+            await self.dedupe.create_index("t", expireAfterSeconds=900)
+        except Exception as e:
+            log.error(f"dedupe TTL index failed: {e}")
         try:
             await self.pending_del.create_index("delete_at")
         except Exception as e:

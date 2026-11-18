@@ -14,7 +14,9 @@ from pyrogram.types import (
     ChatJoinRequest,
 )
 #@suhanibots
-from pyrogram.errors import FloodWait
+from pyrogram.errors import (
+    FloodWait, UserIsBlocked, InputUserDeactivated, PeerIdInvalid, ChatWriteForbidden,
+)
 from config import (
     API_ID, API_HASH, LOGGER, OWNER_ID, WORKER_BOT_WORKERS, WORKER_SEND_RATE,
     WORKER_MAX_ACTIVE_START, WORKER_START_TIMEOUT, WORKER_STALE_START_SECS,
@@ -45,6 +47,7 @@ class WorkerEngine:
         # revives any of them that died / hung. stop_worker() removes a bot from here.
         self.desired: dict[int, dict] = {}
         self._restarting: set = set()
+        self._starting: set = set()          # bots whose Client is being created RIGHT NOW
         self._retry_at: dict[int, float] = {}
         self._retry_fails: dict[int, int] = {}
         self._notified: dict = {}
@@ -86,31 +89,41 @@ class WorkerEngine:
         if not getattr(app, "is_connected", True):
             return "disconnected from Telegram"
 
-        # 1) update queue not draining -> every handler slot is stuck
+        # `seen` grows every time the bot processes an update -> if it moves, the bot is ALIVE
+        # (a long queue during a traffic burst is not a hang).
+        h = getattr(app, "_health", None) or {}
+        seen = h.get("seen", 0)
+        progressing = seen != st.get("last_seen", -1)
+        st["last_seen"] = seen
+
+        # 1) update queue not draining AND nothing processed -> every handler slot is stuck
         try:
             q = app.dispatcher.updates_queue.qsize()
         except Exception:
             q = 0
-        if q > WATCHDOG_QUEUE_LIMIT and q >= st.get("last_q", 0):
+        if q > WATCHDOG_QUEUE_LIMIT and q >= st.get("last_q", 0) and not progressing:
             st["stall"] = st.get("stall", 0) + 1
         else:
             st["stall"] = 0
         st["last_q"] = q
-        if st["stall"] >= 4:
+        if st["stall"] >= 6:
             return f"update queue stuck ({q} waiting)"
 
-        # 2) Telegram does not answer a simple call
+        # 2) Telegram does not answer a simple call (slow answers under load are normal)
         try:
-            await asyncio.wait_for(app.get_me(), timeout=12)
+            await asyncio.wait_for(app.get_me(), timeout=30)
             st["probe_fail"] = 0
         except Exception as e:
-            st["probe_fail"] = st.get("probe_fail", 0) + 1
-            if st["probe_fail"] >= 3:
-                return f"no response from Telegram ({type(e).__name__})"
+            if progressing:
+                st["probe_fail"] = 0        # busy but working
+            else:
+                st["probe_fail"] = st.get("probe_fail", 0) + 1
+                if st["probe_fail"] >= 5:
+                    return f"no response from Telegram ({type(e).__name__})"
         return None
 
     async def _revive(self, bot_id: int, reason: str):
-        if bot_id in self._restarting:
+        if bot_id in self._restarting or bot_id in self._starting:
             return
         self._restarting.add(bot_id)
         try:
@@ -142,17 +155,27 @@ class WorkerEngine:
             self._restarting.discard(bot_id)
 
     async def _watch_one(self, bot_id: int, states: dict):
-        if bot_id in self._restarting:
+        if bot_id in self._restarting or bot_id in self._starting:
             return
         app = self.workers.get(bot_id)
         if app is None:
             if time.monotonic() >= self._retry_at.get(bot_id, 0):
                 await self._revive(bot_id, "worker was not running")
             return
-        reason = await self._diagnose(bot_id, app, states.setdefault(bot_id, {}))
+        st = states.setdefault(bot_id, {})
+        reason = await self._diagnose(bot_id, app, st)
         if reason:
+            # A bot that is in the middle of sending files is given time to finish first
+            # (a restart would cut the delivery in half). Real disconnects restart at once.
+            h = getattr(app, "_health", None) or {}
+            if h.get("active", 0) > 0 and "disconnected" not in reason and st.get("defer", 0) < 8:
+                st["defer"] = st.get("defer", 0) + 1
+                log.info(f"[watchdog] bot {bot_id}: {reason} — deferring restart (delivery in progress)")
+                return
             states.pop(bot_id, None)
             await self._revive(bot_id, reason)
+        else:
+            st["defer"] = 0
 
     async def _watchdog_loop(self):
         states: dict = {}
@@ -182,7 +205,7 @@ class WorkerEngine:
             out[str(bot_id)] = {
                 "active_start": h.get("active", 0), "shedding": h.get("shedding", False),
                 "served": h.get("served", 0), "skipped_overload": h.get("dropped", 0),
-                "skipped_stale": h.get("stale", 0), "queue": q,
+                "skipped_stale": h.get("stale", 0), "duplicates_blocked": h.get("dup", 0), "queue": q,
             }
         return out
 
@@ -213,15 +236,26 @@ class WorkerEngine:
             log.error(f"Failed to start worker bot {bot_id}: {e}")
 
     async def start_worker(self, bot_doc: dict):
-        """Start a single worker bot."""
+        """Start a single worker bot.
+
+        Only ONE Client per bot may ever exist. Two Clients on the same token both receive
+        every update, which is exactly what made users get every file / message twice.
+        """
+        bot_id = bot_doc["_id"]
+        async with self._lock:
+            if bot_id in self.workers or bot_id in self._starting:
+                log.warning(f"Worker {bot_id} already running/starting, skipping")
+                return
+            self._starting.add(bot_id)
+        try:
+            await self._start_worker_inner(bot_doc)
+        finally:
+            self._starting.discard(bot_id)
+
+    async def _start_worker_inner(self, bot_doc: dict):
         bot_id = bot_doc["_id"]
         self.desired[bot_id] = bot_doc        # the watchdog keeps this bot alive
         self._ensure_watchdog()
-
-        async with self._lock:
-            if bot_id in self.workers:
-                log.warning(f"Worker {bot_id} already running, skipping")
-                return
 
         try:
             token = decrypt_token(bot_doc["bot_token_encrypted"])
@@ -272,7 +306,9 @@ class WorkerEngine:
 
         # ---- traffic control state (see worker_start below) ----
         health = {"active": 0, "shedding": False, "served": 0, "dropped": 0, "stale": 0,
-                  "inflight_users": set(), "notice_sec": 0, "notice_n": 0}
+                  "inflight_users": set(), "notice_sec": 0, "notice_n": 0, "seen": 0, "dup": 0}
+        recent_deliveries: dict = {}      # (user, link) -> monotonic time of the last delivery
+        delivering: set = set()           # (user, link) being delivered right now
         app._health = health
         known_users: set = set()          # users already in the DB -> no Mongo read on repeat /start
         ban_cache: dict = {}              # uid -> (monotonic time, banned?)
@@ -292,6 +328,7 @@ class WorkerEngine:
         _last_active = [0.0]
 
         async def update_activity_middleware(client, update):
+            health["seen"] += 1
             now = time.monotonic()
             if now - _last_active[0] > 60:
                 _last_active[0] = now
@@ -374,7 +411,7 @@ class WorkerEngine:
                 return
 
             # Check force-sub (shows the fsub screen itself when needed)
-            if not await fsub.gate(client, message, worker_start_impl):
+            if not await fsub.gate(client, message, guarded_start):
                 return
 
             # Handle /start verify — mark user as verified via shortener
@@ -547,6 +584,8 @@ class WorkerEngine:
                 from utils.caption_logic import get_file_details, format_caption
 
                 sent_msgs = []
+                failed_files = 0
+                _abort = False
                 for msg in messages:
                     if msg.empty:
                         continue
@@ -564,25 +603,47 @@ class WorkerEngine:
                     else:
                         caption_text = original_caption
                         
+                    copied = None
+                    for _attempt in range(5):
+                        if getattr(app, "_retired", False):
+                            break
+                        await send_limiter.acquire()      # smooth, never above WORKER_SEND_RATE/s
+                        try:
+                            copied = await msg.copy(
+                                chat_id=user_id,
+                                caption=caption_text if caption_text else None,
+                                parse_mode=ParseMode.HTML,
+                                protect_content=protect_content,
+                            )
+                            break
+                        except FloodWait as fw:           # wait, then retry (never drop the file)
+                            log.warning(f"FloodWait {fw.value}s while sending files (bot {bot_id})")
+                            await asyncio.sleep(fw.value + 1)
+                        except (UserIsBlocked, InputUserDeactivated, PeerIdInvalid, ChatWriteForbidden):
+                            log.info(f"User {user_id} cannot receive files (blocked / deactivated)")
+                            _abort = True
+                            break
+                        except Exception as e:            # network hiccup etc: retry with back-off
+                            log.warning(f"copy retry {_attempt + 1}/5 for {user_id}: {e}")
+                            await asyncio.sleep(1.5 * (_attempt + 1))
+                    if _abort:
+                        break
+                    if copied is not None:
+                        sent_msgs.append(copied)
+                    else:
+                        failed_files += 1
+
+                if sent_msgs:
+                    message._sf_delivered = True
+                if failed_files:
+                    message._sf_failed = True
                     try:
-                        copied = None
-                        for _attempt in range(3):
-                            await send_limiter.acquire()      # smooth, never above WORKER_SEND_RATE/s
-                            try:
-                                copied = await msg.copy(
-                                    chat_id=user_id,
-                                    caption=caption_text if caption_text else None,
-                                    parse_mode=ParseMode.HTML,
-                                    protect_content=protect_content,
-                                )
-                                break
-                            except FloodWait as fw:           # long flood: wait, then retry (don't drop the file)
-                                log.warning(f"FloodWait {fw.value}s while sending files (bot {bot_id})")
-                                await asyncio.sleep(fw.value + 1)
-                        if copied is not None:
-                            sent_msgs.append(copied)
-                    except Exception as e:
-                        log.error(f"Failed to copy message: {e}")
+                        await message.reply(
+                            f"<b>⚠️ {failed_files} file(s) could not be sent.</b>\n\n"
+                            "<blockquote>Please tap the same link again to get them.</blockquote>"
+                        )
+                    except Exception:
+                        pass
 
                 # Auto-delete
                 del_timer = await worker_db.get_del_timer()
@@ -645,6 +706,33 @@ class WorkerEngine:
         # HANDLER: /ban & /unban (admin only)
         # =====================================================================
 
+        async def guarded_start(client: Client, message: Message):
+            """Never deliver the SAME link to the SAME user twice at once / within seconds
+            (auto-check delivery + tapping 'Joined' + double taps used to send everything twice)."""
+            if getattr(app, "_retired", False) or message.from_user is None:
+                return
+            uid = message.from_user.id
+            arg = message.command[1] if getattr(message, "command", None) and len(message.command) > 1 else None
+            if arg == "verify":
+                arg = None
+            key = (uid, arg)
+            if arg:
+                now = time.monotonic()
+                if key in delivering or now - recent_deliveries.get(key, -1e9) < 15:
+                    health["dup"] += 1
+                    return
+                delivering.add(key)
+            try:
+                await worker_start_impl(client, message)
+            finally:
+                if arg:
+                    delivering.discard(key)
+                    # only a link that REALLY delivered files is remembered (a fsub screen is not a delivery)
+                    if getattr(message, "_sf_delivered", False) and not getattr(message, "_sf_failed", False):
+                        if len(recent_deliveries) > 5000:
+                            recent_deliveries.clear()
+                        recent_deliveries[key] = time.monotonic()
+
         # ---------------------------------------------------------------------
         # TRAFFIC CONTROL for /start
         #  * at most WORKER_MAX_ACTIVE_START users are processed at the same time
@@ -671,7 +759,7 @@ class WorkerEngine:
 
         @app.on_message(filters.command("start") & filters.private)
         async def worker_start(client: Client, message: Message):
-            if message.from_user is None:
+            if message.from_user is None or getattr(app, "_retired", False):
                 return
             user_id = message.from_user.id
             privileged = user_id == owner_id or user_id == OWNER_ID
@@ -705,10 +793,16 @@ class WorkerEngine:
                     await _busy_notice(message)
                     return
 
+            # Exactly-once across processes: if an old + a new copy of this bot run at the
+            # same time (redeploy overlap, second host), only ONE of them answers this message.
+            if not await worker_db.claim_update(f"s:{message.chat.id}:{message.id}"):
+                health["dup"] += 1
+                return
+
             health["active"] += 1
             health["inflight_users"].add(user_id)
             try:
-                await asyncio.wait_for(worker_start_impl(client, message), timeout=WORKER_START_TIMEOUT)
+                await asyncio.wait_for(guarded_start(client, message), timeout=WORKER_START_TIMEOUT)
             except asyncio.TimeoutError:
                 log.error(f"/start of {user_id} timed out after {WORKER_START_TIMEOUT}s (bot {bot_id})")
             except Exception as e:
@@ -948,6 +1042,7 @@ class WorkerEngine:
             app = self.workers.pop(bot_id, None)
 
         if app:
+            app._retired = True       # a half-stopped client must never answer again
             try:
                 fsub_mgr = getattr(app, "_fsub_mgr", None)
                 if fsub_mgr:
@@ -960,10 +1055,14 @@ class WorkerEngine:
                 pass
             try:
                 # Prevent app.stop() from hanging forever if there's a connection issue
-                await asyncio.wait_for(app.stop(block=False), timeout=3.0)
+                await asyncio.wait_for(app.stop(block=False), timeout=15.0)
                 log.info(f"Worker stopped: {bot_id}")
             except Exception as e:
                 log.error(f"Error stopping worker {bot_id}: {e}")
+                try:      # make sure the old connection is really gone before a new one starts
+                    await asyncio.wait_for(app.disconnect(), timeout=5.0)
+                except Exception:
+                    pass
 
     async def stop_all_workers(self):
         """Stop all running worker bots."""
