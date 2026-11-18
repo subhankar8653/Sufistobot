@@ -43,10 +43,39 @@ async def _approved_ids() -> set:
 
 
 async def is_authorized(user_id: int) -> bool:
-    """OWNER_ID, MAIN_ADMINS env, or an admin added with /addadmin."""
+    """OWNER_ID, MAIN_ADMINS env, or an admin added with /addadmin.
+    (= may CREATE bots and use the whole main bot)"""
     if user_id == OWNER_ID or user_id in MAIN_ADMIN_IDS:
         return True
     return user_id in await _approved_ids()
+
+
+_bot_admin_cache = {"t": 0.0, "ids": set()}
+
+
+def invalidate_bot_admins():
+    """Call after a bot admin was added/removed so the panel opens instantly."""
+    _bot_admin_cache["t"] = 0.0
+
+
+async def _bot_admin_ids() -> set:
+    now = time.monotonic()
+    if now - _bot_admin_cache["t"] > _CACHE_TTL:
+        try:
+            _bot_admin_cache["ids"] = await main_db.get_all_bot_admin_ids()
+        except Exception as e:
+            log.error(f"access: could not load bot admins: {e}")  # keep the old list
+        _bot_admin_cache["t"] = now
+    return _bot_admin_cache["ids"]
+
+
+async def can_open_panel(user_id: int) -> bool:
+    """May talk to the main bot at all: approved users AND people who were made
+    admin of some clone bot (they only see / manage the bots they belong to;
+    creating new bots still needs is_authorized)."""
+    if await is_authorized(user_id):
+        return True
+    return user_id in await _bot_admin_ids()
 
 
 # =============================================================================
@@ -58,13 +87,13 @@ async def _gate_message(client: Client, message: Message):
     user = message.from_user
     if user is None:          # channel posts / service messages: not our business
         return
-    if not await is_authorized(user.id):
+    if not await can_open_panel(user.id):
         message.stop_propagation()   # silence: no reply, no error, nothing
 
 
 @Client.on_callback_query(group=-100)
 async def _gate_callback(client: Client, query: CallbackQuery):
-    if not await is_authorized(query.from_user.id):
+    if not await can_open_panel(query.from_user.id):
         try:
             await query.answer()      # empty answer: just stops the loading spinner, shows nothing
         except Exception:
@@ -74,7 +103,7 @@ async def _gate_callback(client: Client, query: CallbackQuery):
 
 @Client.on_inline_query(group=-100)
 async def _gate_inline(client: Client, query: InlineQuery):
-    if not await is_authorized(query.from_user.id):
+    if not await can_open_panel(query.from_user.id):
         query.stop_propagation()
 
 

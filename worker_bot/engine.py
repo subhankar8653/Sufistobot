@@ -330,6 +330,13 @@ class WorkerEngine:
         from worker_bot.fsub_logic import setup_fsub
         fsub = setup_fsub(app, worker_db, bot_id, owner_id, is_admin)
 
+        # /addadmin /deladmin /admins /version  (owner can give admin right inside the clone bot)
+        try:
+            from worker_bot.admin_cmds import setup_admin_cmds
+            setup_admin_cmds(app, worker_db, bot_id, owner_id, is_admin)
+        except Exception as _adm_err:
+            log.error(f"admin_cmds load failed for bot {bot_id}: {_adm_err}")
+
         # =====================================================================
         # HANDLER: /start
         # =====================================================================
@@ -884,6 +891,9 @@ class WorkerEngine:
                     BotCommand("custom_batch", "Generate link for custom posts"),
                     BotCommand("flink", "Formatted links generator"),
                     BotCommand("broadcast", "Broadcast a message (Admin)"),
+                    BotCommand("addadmin", "Add an admin (Owner)"),
+                    BotCommand("deladmin", "Remove an admin (Owner)"),
+                    BotCommand("admins", "List admins"),
                     BotCommand("auto_check", "Fsub step-by-step mode on/off (Admin)"),
                     BotCommand("setfakelink", "Add a fake fsub button (Admin)"),
                     BotCommand("listfakelink", "List fake fsub buttons (Admin)"),

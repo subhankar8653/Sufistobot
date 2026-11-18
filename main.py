@@ -1,8 +1,6 @@
-from bot import Bot
-import pyrogram.utils
+import asyncio
 
-pyrogram.utils.MIN_CHANNEL_ID = -1009147483647
+from run import main
 
 if __name__ == "__main__":
-    Bot().run()
-#@suhanibots
+    asyncio.run(main())

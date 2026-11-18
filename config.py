@@ -11,7 +11,15 @@ from logging.handlers import RotatingFileHandler
 # =============================================================================
 
 # Telegram API credentials from https://my.telegram.org
-API_ID = int(os.environ.get("API_ID", ""))
+def _int_env(name: str, default: int = 0) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+API_ID = _int_env("API_ID")
 APP_ID = API_ID # Alias for backward compatibility
 API_HASH = os.environ.get("API_HASH", "")
 #@suhanibots
@@ -20,7 +28,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 TG_BOT_TOKEN = BOT_TOKEN # Alias for backward compatibility
 #@suhanibots
 # Owner's Telegram user ID (numeric)
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+OWNER_ID = _int_env("OWNER_ID")
 
 # Optional: user IDs that may use the MAIN bot (create / manage bots) besides OWNER_ID.
 # Comma or space separated. The owner can also add/remove people at runtime with /addadmin.
@@ -38,7 +46,7 @@ DB_NAME = MONGO_DB_NAME # Alias for old bot.py
 CHANNEL_ID = 0
 
 # Central log channel for logging bot creations and generated links
-MAIN_LOG_CHANNEL = int(os.environ.get("MAIN_LOG_CHANNEL", ""))
+MAIN_LOG_CHANNEL = _int_env("MAIN_LOG_CHANNEL")
 
 # Force-subscribe channel for the main bot (username without @)
 FSUB_CHANNEL = os.environ.get("FSUB_CHANNEL", "suhanibots") 
@@ -166,7 +174,8 @@ HELP_MSG = """<b>━━━━━━━━━━━━━━━━━━━━━
 <code>/batch</code> — ʟɪɴᴋ ꜰᴏʀ ᴍᴜʟᴛɪᴘʟᴇ ᴘᴏsᴛs
 <code>/custom_batch</code> — ᴄᴜsᴛᴏᴍ ʙᴀᴛᴄʜ
 <code>/flink</code> — ꜰᴏʀᴍᴀᴛᴛᴇᴅ ʟɪɴᴋs
-<code>/ban</code> · <code>/unban</code> — ᴜsᴇʀ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ</blockquote>"""
+<code>/ban</code> · <code>/unban</code> — ᴜsᴇʀ ᴍᴏᴅᴇʀᴀᴛɪᴏɴ
+<code>/addadmin</code> · <code>/deladmin</code> · <code>/admins</code> — ᴀᴅᴍɪɴ ᴍᴀɴᴀɢᴇᴍᴇɴᴛ</blockquote>"""
 
 ABOUT_MSG = """<b>━━━━━━━━━━━━━━━━━━━━━
 ℹ️ 𝗔𝗕𝗢𝗨𝗧

@@ -188,6 +188,17 @@ class MainDB:
     async def remove_bot_admin(self, bot_id: int, admin_id: int):
         await self.bots.update_one({"_id": bot_id}, {"$pull": {"admin_ids": int(admin_id)}})
 
+    async def get_all_bot_admin_ids(self) -> set:
+        """Every user id that is an admin of at least one (non-deleted) bot."""
+        ids = set()
+        async for b in self.bots.find({"is_deleted": {"$ne": True}}, {"admin_ids": 1}):
+            for i in (b.get("admin_ids") or []):
+                try:
+                    ids.add(int(i))
+                except (TypeError, ValueError):
+                    pass
+        return ids
+
     async def sync_bot_admins(self, bot_id: int):
         """Rebuild admin_ids of one bot from its per-bot admins collection."""
         db = get_db()

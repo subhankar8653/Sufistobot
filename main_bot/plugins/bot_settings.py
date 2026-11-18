@@ -1491,8 +1491,10 @@ async def add_admin_callback(client: Client, query: CallbackQuery):
 
     await query.message.edit_text(
         "<b>➕ Add Admin</b>\n\n"
-        "<blockquote>Send the user ID of the person to add as admin.\n\n"
-        "Example: <code>123456789</code></blockquote>",
+        "<blockquote>Send the user ID, the @username, or forward a message of the person.\n\n"
+        "Example: <code>123456789</code>\n\n"
+        "<i>Tip: you can also add admins inside the clone bot itself with "
+        "<code>/addadmin</code>.</i></blockquote>",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Cancel", callback_data=f"admins_{bot_id}")],
         ]),
@@ -1546,6 +1548,11 @@ async def do_rem_admin_callback(client: Client, query: CallbackQuery):
     worker_db = WorkerDB(bot_id)
     await worker_db.del_admin(admin_id)
     await main_db.remove_bot_admin(bot_id, admin_id)
+    try:
+        from main_bot.plugins.access import invalidate_bot_admins
+        invalidate_bot_admins()
+    except Exception:
+        pass
 
     await query.answer(f"✅ Admin {admin_id} removed!", show_alert=True)
     await admins_callback(client, query)
@@ -1556,10 +1563,27 @@ async def handle_admin_input(client: Client, message: Message, state: dict):
     user_id = message.from_user.id
     bot_id = state["data"]["bot_id"]
 
-    try:
-        admin_id = int(message.text.strip())
-    except ValueError:
-        await message.reply("<b>❌ Invalid user ID. Send a number.</b>")
+    admin_id = None
+    raw = (message.text or "").strip()
+    if raw.lstrip("-").isdigit():
+        admin_id = int(raw)
+    else:
+        # forwarded message from the person, or an @username the bot can resolve
+        origin = getattr(message, "forward_origin", None)
+        fwd_user = getattr(origin, "sender_user", None) if origin else getattr(message, "forward_from", None)
+        if fwd_user is not None:
+            admin_id = fwd_user.id
+        elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{4,31}", raw):
+            try:
+                admin_id = (await client.get_users(raw.lstrip("@"))).id
+            except Exception:
+                admin_id = None
+    if admin_id is None:
+        await message.reply(
+            "<b>❌ Could not read that user.</b>\n\n"
+            "<blockquote>Send the numeric user ID, an @username (the person must have started "
+            "this bot once), or forward any message of that person.</blockquote>"
+        )
         return
 
     bot_doc = await main_db.get_bot(bot_id)
@@ -1575,6 +1599,11 @@ async def handle_admin_input(client: Client, message: Message, state: dict):
     worker_db = WorkerDB(bot_id)
     await worker_db.add_admin(admin_id)
     await main_db.add_bot_admin(bot_id, admin_id)   # makes this bot show up in the admin's "My Bots"
+    try:
+        from main_bot.plugins.access import invalidate_bot_admins
+        invalidate_bot_admins()     # the new admin can open the main bot right away
+    except Exception:
+        pass
 
     creation_state = _get_state()
     creation_state.pop(user_id, None)

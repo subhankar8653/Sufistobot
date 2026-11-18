@@ -32,6 +32,16 @@ async def create_bot_callback(client: Client, query: CallbackQuery):
     """Start the bot creation flow."""
     user_id = query.from_user.id
 
+    # Bot admins may manage their bot, but only approved users may create new bots
+    from main_bot.plugins.access import is_authorized
+    if not await is_authorized(user_id):
+        await query.answer(
+            "❌ Only approved users can create bots. You can manage the bots you were "
+            "added to from 'My Bots'.",
+            show_alert=True,
+        )
+        return
+
     # Check bot limit
     bot_count = await main_db.count_user_bots(user_id)
     if bot_count >= MAX_BOTS_PER_USER:

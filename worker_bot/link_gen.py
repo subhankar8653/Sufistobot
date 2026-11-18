@@ -24,7 +24,8 @@ _INVALID = (
     "ꜰᴏʀᴡᴀʀᴅ ᴀ ᴘᴏsᴛ ꜰʀᴏᴍ ᴛʜᴇ ʟᴏɢ ᴄʜᴀɴɴᴇʟ, sᴇɴᴅ ᴀ ꜰɪʟᴇ, ᴏʀ sᴇɴᴅ ᴀ ᴘᴏsᴛ ʟɪɴᴋ.</b>"
 )
 
-_COMMANDS = ["start", "genlink", "batch", "custom_batch", "flink", "ban", "unban", "broadcast"]
+_COMMANDS = ["start", "genlink", "batch", "custom_batch", "flink", "ban", "unban", "broadcast",
+             "addadmin", "deladmin", "admins", "version", "oldchannel"]
 
 
 def setup_link_gen(app: Client, log_channel_id: int, is_admin_func):
